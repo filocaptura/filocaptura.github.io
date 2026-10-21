@@ -2,6 +2,11 @@
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Filocaptura · La Aventura del Pensamiento</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1a1238">
+<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Filocaptura"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" type="image/png" href="icons/icon-192.png"><link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
 <style>
@@ -18,6 +23,23 @@ html,body{margin:0;height:100%;background:#0d0b1a;color:#fff;font-family:"Press 
 .st{display:flex;flex-direction:column;gap:8px}.st div{padding:6px 10px;font-size:8px;border-radius:12px}
 .hint{font-size:7px;color:#7a72b8;text-align:center;line-height:1.6}
 @media (hover:hover) and (pointer:fine){#pad{opacity:.55}}
+#wrap{padding-top:max(6px,env(safe-area-inset-top));padding-bottom:max(6px,env(safe-area-inset-bottom))}
+#apk{display:block;text-align:center;text-decoration:none;margin-top:2px;background:linear-gradient(#7a6af0,#5a4ac8);color:#fff;border:2px solid #cfc8ff;border-radius:12px;padding:10px 14px;font:9px/1.5 "Press Start 2P",monospace;box-shadow:0 3px 0 #2a2450}
+#apk:active{transform:translateY(2px);box-shadow:0 1px 0 #2a2450}
+#inst2{margin-top:2px;background:none;border:0;color:#9d94e0;text-decoration:underline;font:7px/1.6 "Press Start 2P",monospace;cursor:pointer}
+#instbox{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
+#instbox>div{background:#1a1238;border:3px solid #cfc8ff;border-radius:14px;max-width:420px;padding:18px;font:9px/1.9 "Press Start 2P",monospace;color:#fff}
+#instbox h3{margin:0 0 10px;font-size:11px;color:#ffd86b;font-weight:normal}
+#instbox b{color:#ffd86b;font-weight:normal}
+#instbox button{margin-top:12px;background:#6a5ae0;color:#fff;border:2px solid #cfc8ff;border-radius:10px;padding:8px 12px;font:9px "Press Start 2P",monospace}
+/* celular en horizontal: cruceta a la izquierda, A/B a la derecha, pantalla al centro */
+@media (orientation:landscape) and (max-height:560px){
+ #wrap{flex-direction:row;gap:14px;padding:4px max(10px,env(safe-area-inset-left))}
+ #pad{display:contents}
+ .dp{order:0}#c{order:1;width:min(calc(100vw - 290px),calc((100vh - 14px)*1.5));border-width:3px}.ab{order:2}
+ .st{position:fixed;top:6px;right:10px;flex-direction:row}
+ .hint,#apk,#inst2{display:none!important}
+}
 </style>
 <script>window.FILO_READY = window.FILO_READY || new Promise(function (r) { window._filoReady = r; });</script>
 <script type="module">
@@ -71,6 +93,9 @@ if (window._filoReady) window._filoReady(api);
  <div class="ab"><div data-btn="b">B</div><div data-btn="a">A</div></div>
 </div>
 <div class="hint">Flechas/WASD mover · Z/Espacio = A · X = B · Enter = Menú</div>
+<a id="apk" href="Filocaptura.apk" download="Filocaptura.apk">📲 Descarga Filocaptura para tu celular Android</a>
+<button id="inst2">¿Tienes iPhone? Ver cómo instalar</button>
+<div id="instbox"><div id="instin"></div></div>
 </div>
 <script>
 const SPRITE_PNG = {
@@ -4472,5 +4497,24 @@ const fontReady = (document.fonts && document.fonts.load)
   ? Promise.race([document.fonts.load('8px "Press Start 2P"'), new Promise((r) => setTimeout(r, 2500))]).catch(() => {})
   : Promise.resolve();
 Promise.all([fontReady, loadTextures(), withTimeout(window.FILO_READY || Promise.resolve(null), 4500).then((a) => { DB = a; })]).then(boot);
+})();
+</script>
+<script>
+/* app instalable (PWA): service worker + botón de instalar */
+(function(){
+  if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register("sw.js").catch(function(){});
+  var dp = null, b = document.getElementById("inst2"), apk = document.getElementById("apk"), box = document.getElementById("instbox"), inn = document.getElementById("instin");
+  var standalone = (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+  if (standalone || location.hostname === "appassets.androidplatform.net") { if (b) b.style.display = "none"; if (apk) apk.style.display = "none"; }
+  window.addEventListener("beforeinstallprompt", function(e){ e.preventDefault(); dp = e; });
+  window.addEventListener("appinstalled", function(){ if (b) b.style.display = "none"; if (apk) apk.style.display = "none"; if (box) box.style.display = "none"; });
+  function steps(){
+    var h = "<h3>📲 Instalar en iPhone / iPad</h3>Abre esta página en <b>Safari</b>:<br>1. Toca el botón <b>Compartir</b> (el cuadrado con la flecha ↑).<br>2. Elige <b>Agregar a pantalla de inicio</b>.<br>3. Toca <b>Agregar</b>. ¡Listo!<br><br>En Android usa el botón de arriba para descargar la app (APK).";
+    h += '<br><button id="instok">ENTENDIDO</button>';
+    inn.innerHTML = h; box.style.display = "flex";
+    document.getElementById("instok").onclick = function(){ box.style.display = "none"; };
+  }
+  if (b) b.addEventListener("click", function(){ steps(); });
+  if (box) box.addEventListener("click", function(e){ if (e.target === box) box.style.display = "none"; });
 })();
 </script></body></html>
