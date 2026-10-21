@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Filocaptura · La Aventura del Pensamiento</title>
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#1a1238">
@@ -23,9 +23,11 @@ html,body{margin:0;height:100%;background:#0d0b1a;color:#fff;font-family:"Press 
 .st{display:flex;flex-direction:column;gap:8px}.st div{padding:6px 10px;font-size:8px;border-radius:12px}
 .hint{font-size:7px;color:#7a72b8;text-align:center;line-height:1.6}
 @media (hover:hover) and (pointer:fine){#pad{opacity:.55}}
+@media (hover:none) and (pointer:coarse){.hint{display:none}}
 #wrap{padding-top:max(6px,env(safe-area-inset-top));padding-bottom:max(6px,env(safe-area-inset-bottom))}
 #apk{display:block;text-align:center;text-decoration:none;margin-top:2px;background:linear-gradient(#7a6af0,#5a4ac8);color:#fff;border:2px solid #cfc8ff;border-radius:12px;padding:10px 14px;font:9px/1.5 "Press Start 2P",monospace;box-shadow:0 3px 0 #2a2450}
 #apk:active{transform:translateY(2px);box-shadow:0 1px 0 #2a2450}
+#inst2.ios{display:block;text-decoration:none;background:linear-gradient(#7a6af0,#5a4ac8);color:#fff;border:2px solid #cfc8ff;border-radius:12px;padding:10px 14px;font-size:9px;box-shadow:0 3px 0 #2a2450}
 #inst2{margin-top:2px;background:none;border:0;color:#9d94e0;text-decoration:underline;font:7px/1.6 "Press Start 2P",monospace;cursor:pointer}
 #instbox{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
 #instbox>div{background:#1a1238;border:3px solid #cfc8ff;border-radius:14px;max-width:420px;padding:18px;font:9px/1.9 "Press Start 2P",monospace;color:#fff}
@@ -67,6 +69,15 @@ const api = {
   async saveProfile(key, obj) { await setDoc(doc(db, "shared", "filo_" + key), { value: JSON.stringify(obj) }); },
   async getConfig() { const s = await getDoc(doc(db, "shared", "filo_config")); return s.exists() ? JSON.parse(s.data().value) : null; },
   async setConfig(obj) { await setDoc(doc(db, "shared", "filo_config"), { value: JSON.stringify(obj) }); },
+  async getComodines() { const s = await getDoc(doc(db, "shared", "filo_comodines")); if (!s.exists()) return {}; try { return JSON.parse(s.data().value) || {}; } catch (e) { return {}; } },
+  async updComodines(fn) {
+    const ref = doc(db, "shared", "filo_comodines");
+    await runTransaction(db, async (tx) => {
+      const s = await tx.get(ref); let d = {};
+      if (s.exists()) { try { d = JSON.parse(s.data().value) || {}; } catch (e) {} }
+      tx.set(ref, { value: JSON.stringify(fn(d)) });
+    });
+  },
   async pay(cursoId, nombre, amount, motivo) {
     const ref = doc(db, "shared", TP), mref = doc(db, "shared", MOV);
     await runTransaction(db, async (tx) => {
@@ -741,7 +752,9 @@ function startMusic(name) {
   return true;
 }
 function playJingle(name) { if (!SOUND_ON || !TRACKS[name]) return; MUS.lock = true; if (!startMusic(name)) MUS.lock = false; }
-["keydown", "pointerdown", "touchstart"].forEach((ev) => window.addEventListener(ev, () => { if (SOUND_ON && actx && actx.state === "suspended") actx.resume().catch(() => {}); }, { passive: true }));
+["keydown", "pointerdown", "touchstart", "touchend"].forEach((ev) => window.addEventListener(ev, () => { if (SOUND_ON && actx && actx.state !== "running" && actx.state !== "closed") actx.resume().catch(() => {}); }, { passive: true }));
+/* iPhone: al volver de otra app o de una llamada el audio queda "interrumpido" */
+document.addEventListener("visibilitychange", () => { if (!document.hidden && SOUND_ON && actx && actx.state !== "running" && actx.state !== "closed") actx.resume().catch(() => {}); });
 
 const TRACKS = {
   title: { bpm: 84, chords: "Dm Bb Gm A Dm Bb C A".split(" "), pad: 0.03, arp: "slow", av: 0.018, bass: "half", drums: "soft", lead: "p25", lv: 0.05,
@@ -1658,7 +1671,7 @@ async function bossEpicuro(n) {
   }
   if (ok === 3) award("ataraxia");
   await say(ok ? `Epicuro: ${ok} de 3. ¡Ahora un combate sin odio… pero con ganas!` : "Epicuro: 0 de 3. Nada grave: lo malo es fácil de soportar. ¡Combatamos!");
-  const r = await runBattle({ kind: "boss", name: "Epicuro", casa: "V", handicap: ok, foes: [["zenon_citio", 15], ["pirron", 16], ["epicuro", 18]] });
+  const r = await runBattle({ kind: "boss", name: "Epicuro", casa: "V", handicap: ok, foes: [["zenon_citio", 14], ["pirron", 15], ["epicuro", 17]] });
   if (r === "win") {
     await medalCeremony(4);
     await say("Epicuro: «De todas las cosas que la sabiduría proporciona, la mayor es la amistad.» Sigue tu camino, amigo.");
@@ -2188,7 +2201,7 @@ async function bossDescartes(n) {
   }
   if (ok === 3) award("cogito");
   await say(ok ? `Descartes: ${ok} de 3. ¡Ahora un combate, con método!` : "Descartes: 0 de 3. Duda, y vuelve a pensar… ¡pero combatamos!");
-  const r = await runBattle({ kind: "boss", name: "Descartes", casa: "IX", handicap: ok, foes: [["spinoza", 19], ["leibniz", 20], ["descartes", 22]] });
+  const r = await runBattle({ kind: "boss", name: "Descartes", casa: "IX", handicap: ok, foes: [["spinoza", 18], ["leibniz", 19], ["descartes", 21]] });
   if (r === "win") {
     await medalCeremony(8);
     await say("Descartes: «Para examinar la verdad hay que dudar, una vez en la vida, de todas las cosas.» Sigue hacia Edimburgo, donde otro pensador duda… de la razón misma.");
@@ -2587,7 +2600,7 @@ async function bossNietzsche(n) {
   }
   if (ok === 3) award("zaratustra");
   await say(ok ? `Nietzsche: ${ok} de 3. ¡Ahora filosofemos a martillazos!` : "Nietzsche: 0 de 3. Rompe tus ídolos… ¡y combatamos!");
-  const r = await runBattle({ kind: "boss", name: "Nietzsche", casa: "XII", handicap: ok, foes: [["kierkegaard", 22], ["sartre", 23], ["nietzsche", 26]] });
+  const r = await runBattle({ kind: "boss", name: "Nietzsche", casa: "XII", handicap: ok, foes: [["kierkegaard", 21], ["sartre", 22], ["nietzsche", 25]] });
   if (r === "win") {
     await medalCeremony(11);
     await say("Nietzsche: «Hay que llevar un caos dentro de sí para dar a luz una estrella danzante.» Has reunido las 12 medallas.");
@@ -2631,7 +2644,10 @@ const TRAINERS_C13 = {
   inspector_f: { name: "Inspector", intro: "Inspector: ¡Alto! Nadie entra a la sala del profesor sin pasar por mí.", win: "Inspector: Está bien, pasa. Pero sin correr por los pasillos.", done: "Inspector: Adelante, el profesor ya te espera.", foes: [["nietzsche", 24], ["descartes", 24], ["aristoteles", 25]] },
 };
 async function bossProfesor(n) {
-  if (S.flags.final) { await say("Profesor: Ya eres un filósofo. Sigue preguntando, y sigue enseñando a otros a preguntar."); return; }
+  if (S.flags.final) {
+    if (!S.flags.comodin) { await say("Profesor: ¡Me faltaba entregarte algo por vencerme!"); await comodinCeremony(); return; }
+    await say("Profesor: Ya eres un filósofo. Sigue preguntando, y sigue enseñando a otros a preguntar."); return;
+  }
   await say("Profesor: Así que llegaste hasta aquí. Doce Casas, doce jefes, doce medallas…");
   await say("Profesor: Pero un filósofo no se mide por sus medallas, sino por sus preguntas. Veamos qué aprendiste de verdad.");
   await say("Profesor: Te haré 5 preguntas, de todo el recorrido. Cada acierto debilitará a mi último filósofo.");
@@ -2644,7 +2660,7 @@ async function bossProfesor(n) {
   }
   if (ok === 5) award("sobresaliente");
   await say(ok ? `Profesor: ${ok} de 5. Ahora, la batalla final, ¡con todos mis filósofos!` : "Profesor: 0 de 5. Hay que estudiar más… ¡pero igual combatamos!");
-  const r = await runBattle({ kind: "boss", name: "Profesor", casa: "FINAL", handicap: ok, foes: [["socrates", 27], ["aristoteles", 28], ["kant", 30], ["profesor", 33]] });
+  const r = await runBattle({ kind: "boss", name: "Profesor", casa: "FINAL", handicap: ok, foes: [["socrates", 22], ["aristoteles", 23], ["kant", 24], ["profesor", 25]] });
   if (r === "win") {
     S.flags.boss13 = true; S.flags.final = true;
     SFX.medal(); for (let i = 0; i < 8; i++) { ui.flash = 0.8; await frames(4); ui.flash = 0; await frames(6); }
@@ -2652,6 +2668,8 @@ async function bossProfesor(n) {
     await say("Profesor: ¡Lo lograste! Has recorrido desde Mileto hasta Sils-María, de los presocráticos a Nietzsche.");
     await say("Profesor: No te doy una nota. Te doy una tarea: sigue preguntando. Pregúntale al mundo, a tus amigos y, sobre todo, a ti mismo.");
     await say("Profesor: Como diría Sócrates: «Una vida sin examen no merece ser vivida». Felicitaciones, filósofo.");
+    await say("Profesor: Ah, y una cosa más. Dije que no te daría una nota… pero esto te puede ayudar con una.");
+    await comodinCeremony();
     await say("★ ¡FELICITACIONES! Completaste FILOCAPTURA · La Aventura del Pensamiento ★");
     saveGame();
   } else if (r === "lose") await whiteout();
@@ -3029,6 +3047,182 @@ function buildQuests() {
   }
 }
 /* ============================================================
+   COMODÍN DE DÉCIMAS · premio por vencer al Profesor (Casa XIII)
+   El juego solo lo entrega y lo registra. Cuántas décimas vale,
+   en qué evaluación se usa y si se anula lo decide el profesor
+   (menú COMODINES del modo admin). Se guarda en shared/filo_comodines.
+   ============================================================ */
+let COMODIN = null; // registro en la nube de este alumno: {nombre,curso,t,estado,decimas,nota}
+const COMODIN_MAX_DEC = 10;
+const comodinGanado = () => !!((S && S.flags && (S.flags.comodin || S.flags.final)) || (SAVED && SAVED.flags && (SAVED.flags.comodin || SAVED.flags.final)) || (ACH.graduado && ACH.graduado.st !== "admin"));
+const decTxt = (n) => n + (n === 1 ? " décima" : " décimas");
+function comodinEstado(c) {
+  if (!c) return { t: "Por registrar", col: "#8a6a20" };
+  if (c.estado === "anulado") return { t: "Anulado", col: "#a02a3a" };
+  if (c.estado === "canjeado") return { t: "Canjeado" + (c.decimas ? " · " + decTxt(c.decimas) : ""), col: "#5a5a6a" };
+  if (c.decimas) return { t: "Vale " + decTxt(c.decimas), col: "#2a8a3a" };
+  return { t: "Valor por decidir", col: "#8a6a20" };
+}
+/* registra el comodín si se ganó y aún no está en la nube; trae su estado */
+async function syncComodin() {
+  if (!ID || ID.admin || !comodinGanado()) return COMODIN;
+  await ensureDB(); if (!DB || !DB.updComodines) return COMODIN;
+  try {
+    const t = (S && S.flags && typeof S.flags.comodin === "number") ? S.flags.comodin : Date.now();
+    let mine = null;
+    const all = await withTimeout(DB.getComodines(), 6000);
+    if (all && all[ID.key]) { COMODIN = all[ID.key]; return COMODIN; }
+    if (!all) return COMODIN;
+    await withTimeout(DB.updComodines((d) => {
+      if (!d[ID.key]) d[ID.key] = { nombre: ID.nombre, curso: ID.curso, t, estado: "pendiente", decimas: 0, nota: "" };
+      mine = d[ID.key]; return d;
+    }), 8000);
+    if (mine) COMODIN = mine;
+  } catch (e) {}
+  return COMODIN;
+}
+
+/* ---------- dibujo de la tarjeta ---------- */
+function drawComodinCard(cx, cy, k) {
+  // k: 0..1 (animación de giro al aparecer)
+  const w = Math.max(2, Math.round(92 * Math.abs(Math.cos((1 - k) * Math.PI / 2)))), h = 116, x = Math.round(cx - w / 2), y = Math.round(cy - h / 2);
+  ctx.fillStyle = COL.ink; ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
+  ctx.fillStyle = "#d4af37"; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = "#fff0a8"; ctx.fillRect(x + 1, y + 1, w - 2, 1);
+  ctx.fillStyle = "#3a1f6a"; ctx.fillRect(x + 3, y + 3, w - 6, h - 6);
+  if (w < 80) return;
+  for (let i = 0; i < 6; i++) { const sx = x + 10 + ((i * 37 + Math.floor(tick / 9)) % (w - 20)), sy = y + 8 + ((i * 53) % (h - 16)); ctx.fillStyle = (tick + i * 7) % 30 < 15 ? "#fff6c8" : "#b89ae8"; ctx.fillRect(sx, sy, 1, 1); }
+  txt("COMODÍN", cx, y + 9, "#ffd86b", { align: "center", shadow: COL.ink });
+  txt("DE DÉCIMAS", cx, y + 20, "#ffd86b", { align: "center", shadow: COL.ink, max: w - 10 });
+  ctx.fillStyle = "#d4af37"; ctx.beginPath(); ctx.arc(cx, cy + 4, 24, 0, 7); ctx.fill();
+  ctx.fillStyle = "#f6e08a"; ctx.beginPath(); ctx.arc(cx, cy + 4, 21, 0, 7); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.5)"; ctx.beginPath(); ctx.arc(cx - 7, cy - 4, 6, 0, 7); ctx.fill();
+  const v = COMODIN && COMODIN.decimas && COMODIN.estado !== "anulado" ? "+" + (COMODIN.decimas / 10).toFixed(1).replace(".", ",") : "+0,?";
+  txt(v, cx, cy, "#3a1f6a", { align: "center" });
+  const fijo = COMODIN && COMODIN.decimas && COMODIN.estado !== "anulado";
+  txt(fijo ? "Valor fijado" : "Lo decide", cx, y + h - 26, "#e4d8ff", { align: "center", max: w - 8 });
+  txt(fijo ? "por el Profesor" : "el Profesor", cx, y + h - 16, "#e4d8ff", { align: "center", max: w - 8 });
+}
+function drawComodinCeremony(sc) {
+  ctx.fillStyle = "rgba(10,10,30,.88)"; ctx.fillRect(0, 0, W, H);
+  const t = tick - sc.t0;
+  for (let i = 0; i < 16; i++) { const a = i * Math.PI / 8 + t * 0.02; ctx.fillStyle = "rgba(200,160,255,.22)"; ctx.beginPath(); ctx.moveTo(120, 62); ctx.lineTo(120 + Math.cos(a) * 140, 62 + Math.sin(a) * 140); ctx.lineTo(120 + Math.cos(a + 0.12) * 140, 62 + Math.sin(a + 0.12) * 140); ctx.fill(); }
+  drawComodinCard(120, 62, Math.min(1, t / 40));
+}
+function drawComodinScreen(sc) {
+  ctx.fillStyle = "#28324f"; ctx.fillRect(0, 0, W, H);
+  txt("MI COMODÍN", 8, 5, "#ffd86b");
+  drawComodinCard(56, 80, 1);
+  box(108, 18, 128, 138);
+  const e = comodinEstado(COMODIN);
+  let y = 25;
+  txt("Estado:", 115, y, "#6a5a7a"); y += 11;
+  wrapPx(e.t, 114).slice(0, 2).forEach((l) => { txt(l, 115, y, e.col); y += 11; });
+  const c = COMODIN;
+  if (c && c.t) { y += 2; txt("Ganado el " + new Date(c.t).toLocaleDateString("es-CL"), 115, y, COL.text, { max: 116 }); y += 13; }
+  const msg = !c ? "Se enviará al profesor cuando haya conexión."
+    : c.estado === "anulado" ? "Habla con tu profesor."
+    : c.nota ? "Profesor: " + c.nota
+    : c.estado === "canjeado" ? "Ya lo usaste. ¡Bien hecho!"
+    : "Muéstrale esta tarjeta a tu profesor: él decide cuántas décimas vale y en qué evaluación usarlo.";
+  wrapPx(msg, 114).slice(0, 7).forEach((l) => { txt(l, 115, y, COL.text); y += 11; });
+}
+
+/* ---------- el alumno ve su comodín ---------- */
+async function comodinScreen() {
+  ui.prompt = ["Consultando", "al profesor…"]; ui.promptW = 110;
+  await syncComodin();
+  ui.prompt = null; ui.promptW = 236;
+  ui.screen = { kind: "comodin" };
+  await waitPress(["a", "b"]);
+  ui.screen = null;
+}
+/* ---------- ceremonia al vencer al Profesor ---------- */
+async function comodinCeremony() {
+  S.flags.comodin = Date.now();
+  SFX.medal(); ui.screen = { kind: "comodinC", t0: tick };
+  for (let i = 0; i < 8; i++) { ui.flash = 0.6; await frames(4); ui.flash = 0; await frames(6); }
+  await frames(30);
+  await say("¡Obtuviste el COMODÍN DE DÉCIMAS!");
+  await say("Profesor: ¿Cuántas décimas vale y en qué prueba lo usarás? Eso lo decido yo. Muéstrame esta tarjeta en clases.");
+  ui.screen = null;
+  saveGame();
+  if (!ID || ID.admin) { await say("(Modo admin: el comodín no se registra.)", { auto: 50 }); return; }
+  await syncComodin();
+  if (!COMODIN) await say("(Sin conexión: tu comodín se enviará al profesor la próxima vez que entres con internet.)");
+  else await say("Tu comodín quedó registrado. Puedes verlo en el menú: COMODÍN.", { auto: 60 });
+}
+
+/* ---------- panel del profesor ---------- */
+async function adminComodines() {
+  await ensureDB();
+  if (!DB || !DB.getComodines) { await say("Sin conexión a la base de datos. Abre el juego desde la página publicada y con internet."); return; }
+  let cur = 0;
+  for (;;) {
+    let d = null;
+    ui.prompt = ["Cargando", "comodines…"]; ui.promptW = 100;
+    try { d = await withTimeout(DB.getComodines(), 8000); } catch (e) {}
+    ui.prompt = null; ui.promptW = 236;
+    if (!d) { await say("No se pudo leer la lista. Revisa la conexión."); return; }
+    const keys = Object.keys(d).sort((a, b) => (d[a].curso + d[a].nombre).localeCompare(d[b].curso + d[b].nombre, "es"));
+    if (!keys.length) { await say("Todavía ningún estudiante ha vencido al Profesor. Cuando alguien lo haga, aparecerá aquí."); return; }
+    const corto = (c) => (c === "3medio" ? "3°M" : c === "4medio" ? "4°M" : c);
+    const items = keys.map((k) => d[k].nombre + " · " + corto(d[k].curso) + " · " + comodinEstado(d[k]).t);
+    const pend = keys.filter((k) => d[k].estado === "pendiente" && !d[k].decimas).length;
+    items.push(pend ? "» DAR EL MISMO VALOR A LOS " + pend + " SIN VALOR" : "» (todos tienen valor)");
+    const sel = await pickFromList("COMODINES (" + keys.length + ")", items);
+    if (sel < 0) return;
+    cur = sel;
+    if (sel === keys.length) {
+      if (!pend) continue;
+      const n = await pedirDecimas("VALOR PARA LOS " + pend + " SIN VALOR");
+      if (n == null) continue;
+      try { await DB.updComodines((x) => { for (const k in x) if (x[k].estado === "pendiente" && !x[k].decimas) { x[k].decimas = n; x[k].tAdmin = Date.now(); } return x; }); SFX.heal(); await say("Listo: " + pend + " comodines ahora valen " + decTxt(n) + ".", { auto: 50 }); }
+      catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
+      continue;
+    }
+    const k = keys[sel], c = d[k];
+    await say(c.nombre + ". Ganado el " + new Date(c.t).toLocaleDateString("es-CL") + ". " + comodinEstado(c).t + (c.nota ? ". Nota: " + c.nota : "") + ".");
+    const opts = ["ASIGNAR DÉCIMAS", c.estado === "canjeado" ? "DESMARCAR CANJE" : "MARCAR CANJEADO", "ESCRIBIR NOTA", c.estado === "anulado" ? "REACTIVAR" : "ANULAR", "VOLVER"];
+    const r = await menu(opts, { x: 100, y: 30, w: 136, cancel: true });
+    let patch = null;
+    if (r === 0) { const n = await pedirDecimas("¿CUÁNTO VALE? · " + c.nombre); if (n != null) patch = { decimas: n }; }
+    else if (r === 1) patch = { estado: c.estado === "canjeado" ? "pendiente" : "canjeado" };
+    else if (r === 2) { const t = await keyEntry("NOTA PARA " + c.nombre); if (t !== null) patch = { nota: t.trim().slice(0, 60) }; }
+    else if (r === 3) {
+      if (c.estado !== "anulado") { const s = await menu(["NO", "SÍ, ANULAR"], { x: 108, y: 84, w: 128, cancel: true }); if (s === 1) patch = { estado: "anulado" }; }
+      else patch = { estado: "pendiente" };
+    }
+    if (!patch) continue;
+    try { await DB.updComodines((x) => { if (x[k]) Object.assign(x[k], patch, { tAdmin: Date.now() }); return x; }); SFX.heal(); await say("Guardado.", { auto: 30 }); }
+    catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
+  }
+}
+async function pedirDecimas(title) {
+  const opts = Array.from({ length: COMODIN_MAX_DEC }, (_, i) => decTxt(i + 1) + "  (+" + ((i + 1) / 10).toFixed(1).replace(".", ",") + ")");
+  opts.push("SIN VALOR (por decidir)");
+  const i = await pickFromList(title, opts);
+  if (i < 0) return null;
+  return i === COMODIN_MAX_DEC ? 0 : i + 1;
+}
+
+/* ---------- diagnóstico de conexión (solo lectura) para el profesor ---------- */
+async function adminDiagnostico() {
+  ui.prompt = ["Probando", "conexión…"]; ui.promptW = 100;
+  const t0 = Date.now(); await ensureDB();
+  const out = [];
+  if (!DB) { ui.prompt = null; ui.promptW = 236; await say("SIN CONEXIÓN: no cargó Firebase. Si estás en el colegio, puede que la red bloquee «gstatic.com» o «googleapis.com». Prueba con datos móviles."); return; }
+  const prueba = async (nombre, fn) => { const t = Date.now(); try { const r = await withTimeout(fn(), 8000); if (r === null) throw 0; out.push(nombre + ": OK (" + (Date.now() - t) + " ms)"); return r; } catch (e) { out.push(nombre + ": FALLÓ"); return null; } };
+  const ro = await prueba("Lista de cursos", () => DB.roster());
+  await prueba("Claves de puertas", async () => (await DB.getConfig()) || {});
+  const co = await prueba("Comodines", () => DB.getComodines());
+  ui.prompt = null; ui.promptW = 236;
+  await say(out.join(". ") + ".");
+  if (ro) await say("Cursos encontrados: " + ro.map((c) => c.nombre + " (" + c.estudiantes.length + ")").join(", ") + ".");
+  if (co) await say("Comodines registrados: " + Object.keys(co).length + ".");
+  await say(out.some((l) => l.includes("FALLÓ")) ? "Hay problemas de conexión: los terrapesos y comodines se guardarán en el celular y se enviarán cuando vuelva internet." : "¡Todo bien! Firebase responde.");
+}
+/* ============================================================
    INTERFAZ: cajas, texto, menús, preguntas con temporizador
    ============================================================ */
 const ui = { toasts: [], text: null, prompt: null, promptW: 236, menu: null, q: null, screen: null, banner: null, wipe: 0, fade: 0, bubble: null, flash: 0 };
@@ -3323,6 +3517,7 @@ async function loadProfile() {
   const cs = cloud && cloud.save;
   SAVED = [local, cs].filter((d) => d && d.v === 1).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))[0] || null;
   persistAch();
+  COMODIN = null; syncComodin();
 }
 function loadGame() {
   try {
@@ -3897,7 +4092,10 @@ async function pauseMenu() {
   SFX.select();
   for (;;) {
     const opts = ["EQUIPO", "FILOSOFODEX", "MEDALLAS", "LOGROS", "MISIONES", "GUARDAR", "SONIDO: " + (SOUND_ON ? "SÍ" : "NO"), "CERRAR"];
-    const r = await menu(opts, { x: 124, y: 4, w: 112 });
+    if (S.flags.comodin || S.flags.final) opts.splice(4, 0, "COMODÍN");
+    let r = await menu(opts, { x: 124, y: 4, w: 112 });
+    if (opts[r] === "COMODÍN") { await comodinScreen(); continue; }
+    if (r > 4 && opts.length > 8) r--;
     if (r === -1 || r === 7) break;
     if (r === 0) await partyScreen(false);
     if (r === 1) await dexScreen();
@@ -4280,7 +4478,7 @@ function drawMedals(sc) {
   const M = MEDALS[sc.cur], got = S.medals.includes(sc.cur);
   box(4, 120, 232, 36);
   txt("Casa " + M.casa + " · " + M.era, 12, 126);
-  txt(got ? M.name + " (" + M.boss + ")" : sc.cur < 3 ? "Jefe: " + M.boss : "Próximamente…", 12, 140, got ? "#a02a3a" : "#6a5a7a", { max: 218 });
+  txt(got ? M.name + " (" + M.boss + ")" : "Jefe: " + M.boss, 12, 140, got ? "#a02a3a" : "#6a5a7a", { max: 218 });
 }
 function drawList(sc) {
   ctx.fillStyle = "#28324f"; ctx.fillRect(0, 0, W, H);
@@ -4389,7 +4587,7 @@ function drawAll() {
   ctx.clearRect(0, 0, W, H);
   if (mode === "title") drawTitle(); else if (mode === "battle" && bt) drawBattle(); else if (S) drawWorld();
   const sc = ui.screen;
-  if (sc) { if (sc.kind === "party") drawPartyScreen(sc); else if (sc.kind === "dex") drawDex(sc); else if (sc.kind === "medals") drawMedals(sc); else if (sc.kind === "starter") drawStarter(sc); else if (sc.kind === "list") drawList(sc); else if (sc.kind === "pin") drawPin(sc); else if (sc.kind === "keypad") drawKeypad(sc); else if (sc.kind === "logros") drawLogros(sc); else if (sc.kind === "medal") drawMedalCeremony(sc); }
+  if (sc) { if (sc.kind === "party") drawPartyScreen(sc); else if (sc.kind === "dex") drawDex(sc); else if (sc.kind === "medals") drawMedals(sc); else if (sc.kind === "starter") drawStarter(sc); else if (sc.kind === "list") drawList(sc); else if (sc.kind === "pin") drawPin(sc); else if (sc.kind === "keypad") drawKeypad(sc); else if (sc.kind === "logros") drawLogros(sc); else if (sc.kind === "medal") drawMedalCeremony(sc); else if (sc.kind === "comodin") drawComodinScreen(sc); else if (sc.kind === "comodinC") drawComodinCeremony(sc); }
   if (ui.banner) { const t = tick - ui.banner.t0; if (t > 150) ui.banner = null; else { const y = t < 12 ? -20 + t * 2 : t > 138 ? -20 + (150 - t) * 2 : 4; box(4, y, Math.ceil(tw(ui.banner.t)) + 18, 18); txt(ui.banner.t, 13, y + 6); } }
   drawToast();
   if (ui.prompt) { box(2, 120, ui.promptW, 38); ui.prompt.forEach((l, i) => txt(l, 10, 126 + i * 11)); }
@@ -4445,8 +4643,8 @@ async function titleScreen() {
     if (!(await identify())) { ID = null; continue; }
     await loadProfile();
     for (;;) {
-      const opts = []; if (hasSave()) opts.push("CONTINUAR"); opts.push("NUEVO JUEGO", "MIS LOGROS"); if (ID.admin) opts.push("CLAVES DE PUERTAS", "REINICIAR ALUMNO"); opts.push("CAMBIAR JUGADOR");
-      const r = await menu(opts, { x: 60, y: opts.length > 4 ? 64 : 84, w: 120, cancel: false });
+      const opts = []; if (hasSave()) opts.push("CONTINUAR"); opts.push("NUEVO JUEGO", "MIS LOGROS"); if (!ID.admin && comodinGanado()) opts.push("MI COMODÍN"); if (ID.admin) opts.push("COMODINES", "CLAVES DE PUERTAS", "REINICIAR ALUMNO", "PROBAR CONEXIÓN"); opts.push("CAMBIAR JUGADOR");
+      const r = await menu(opts, { x: 52, y: opts.length > 4 ? Math.max(4, 150 - (opts.length * 12 + 10)) : 84, w: 136, cancel: false });
       const choice = opts[r];
       if (choice === "CONTINUAR") { if (loadGame()) { await fadeTo(1, 12); await startGame(false); return; } }
       else if (choice === "NUEVO JUEGO") {
@@ -4455,6 +4653,9 @@ async function titleScreen() {
         await fadeTo(1, 12); await startGame(true); return;
       } else if (choice === "MIS LOGROS") await logrosScreen();
       else if (choice === "REINICIAR ALUMNO") await resetStudent();
+      else if (choice === "MI COMODÍN") await comodinScreen();
+      else if (choice === "COMODINES") await adminComodines();
+      else if (choice === "PROBAR CONEXIÓN") await adminDiagnostico();
       else if (choice === "CLAVES DE PUERTAS") await adminKeys();
       else { try { localStorage.removeItem("filosofos-id"); } catch (e) {} ID = null; break; }
     }
@@ -4489,7 +4690,7 @@ function musicUpdate() {
 }
 function boot() {
   makeTiles();
-  window.__FILO = { ui, get S() { return S; }, P, get mode() { return mode; }, get bt() { return bt; }, input, press, get MAPS() { return MAPS; }, get DEX() { return DEX; }, get QUESTS() { return QUESTS; }, get ID() { return ID; }, runBattle, mhp, stats };
+  window.__FILO = { ui, get S() { return S; }, P, get mode() { return mode; }, get bt() { return bt; }, input, press, get MAPS() { return MAPS; }, get DEX() { return DEX; }, get QUESTS() { return QUESTS; }, get ID() { return ID; }, runBattle, mhp, stats, t: { bossProfesor, comodinCeremony, comodinScreen, syncComodin, adminComodines, get COMODIN() { return COMODIN; }, get ACH() { return ACH; }, mkMon, calcDmg, typeMult, MEDALS } };
   requestAnimationFrame(frame);
   titleScreen();
 }
@@ -4505,11 +4706,18 @@ Promise.all([fontReady, loadTextures(), withTimeout(window.FILO_READY || Promise
   if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register("sw.js").catch(function(){});
   var dp = null, b = document.getElementById("inst2"), apk = document.getElementById("apk"), box = document.getElementById("instbox"), inn = document.getElementById("instin");
   var standalone = (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+  var ua = navigator.userAgent || "", ios = /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1), android = /Android/i.test(ua);
+  var safari = ios && !/CriOS|FxiOS|EdgiOS|OPiOS|GSA\//.test(ua);
   if (standalone || location.hostname === "appassets.androidplatform.net") { if (b) b.style.display = "none"; if (apk) apk.style.display = "none"; }
+  else if (ios) { if (apk) apk.style.display = "none"; if (b) { b.className = "ios"; b.textContent = "📲 Instala Filocaptura en tu iPhone"; } }
+  else if (android && b) b.style.display = "none";
   window.addEventListener("beforeinstallprompt", function(e){ e.preventDefault(); dp = e; });
   window.addEventListener("appinstalled", function(){ if (b) b.style.display = "none"; if (apk) apk.style.display = "none"; if (box) box.style.display = "none"; });
   function steps(){
-    var h = "<h3>📲 Instalar en iPhone / iPad</h3>Abre esta página en <b>Safari</b>:<br>1. Toca el botón <b>Compartir</b> (el cuadrado con la flecha ↑).<br>2. Elige <b>Agregar a pantalla de inicio</b>.<br>3. Toca <b>Agregar</b>. ¡Listo!<br><br>En Android usa el botón de arriba para descargar la app (APK).";
+    var h = "<h3>📲 Instalar en iPhone / iPad</h3>";
+    if (ios && !safari) h += "Estás en otro navegador: lo más seguro es abrir esta página en <b>Safari</b>.<br><br>";
+    h += "1. Toca el botón <b>Compartir</b> (el cuadrado con la flecha ↑). Si no lo ves, toca <b>···</b> primero.<br>2. Elige <b>Agregar a pantalla de inicio</b> (a veces hay que bajar en la lista).<br>3. Activa <b>Abrir como app web</b> si aparece, y toca <b>Agregar</b>.<br>4. Abre Filocaptura desde el ícono nuevo. ¡Listo!<br><br>Tu partida se guarda en la nube: entra con tu mismo nombre y la recuperas.<br>Si no suena: revisa que el iPhone no esté en silencio.";
+    if (!ios) h += "<br><br>En Android usa el botón de descarga de la app (APK).";
     h += '<br><button id="instok">ENTENDIDO</button>';
     inn.innerHTML = h; box.style.display = "flex";
     document.getElementById("instok").onclick = function(){ box.style.display = "none"; };
