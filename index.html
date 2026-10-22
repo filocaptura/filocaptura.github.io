@@ -46,7 +46,7 @@ html,body{margin:0;height:100%;background:#0d0b1a;color:#fff;font-family:"Press 
 <script>window.FILO_READY = window.FILO_READY || new Promise(function (r) { window._filoReady = r; });</script>
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc, runTransaction } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+import { getFirestore, doc, getDoc, setDoc, runTransaction, onSnapshot } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 const app = initializeApp({
   apiKey: "AIzaSyD6QGZ8-0kTadVXxEPavR0fUm_8XD1vqEQ",
   authDomain: "deusivenatura-b042b.firebaseapp.com",
@@ -57,6 +57,7 @@ const app = initializeApp({
 });
 const db = getFirestore(app);
 const TP = "terrapesos-data-v1", MOV = "terrapesos-movimientos";
+const J = (s) => { if (!s.exists()) return null; try { return JSON.parse(s.data().value); } catch (e) { return null; } };
 const addT = (p, n) => ((parseInt(String(p).replace(/[.\s]/g, ""), 10) || 0) + n).toLocaleString("es-CL");
 const api = {
   async roster() {
@@ -77,6 +78,24 @@ const api = {
       if (s.exists()) { try { d = JSON.parse(s.data().value) || {}; } catch (e) {} }
       tx.set(ref, { value: JSON.stringify(fn(d)) });
     });
+  },
+  /* genéricos (duelos): documentos {value: JSON} de la colección shared */
+  TP, MOV,
+  async get(name) { return J(await getDoc(doc(db, "shared", name))); },
+  async txn(names, fn) {
+    return runTransaction(db, async (tx) => {
+      const refs = names.map((n) => doc(db, "shared", n)), D = {}, before = {};
+      for (let i = 0; i < refs.length; i++) { D[names[i]] = J(await tx.get(refs[i])); before[names[i]] = JSON.stringify(D[names[i]]); }
+      const res = fn(D);
+      names.forEach((n, i) => { const v = JSON.stringify(D[n]); if (D[n] != null && v !== before[n]) tx.set(refs[i], { value: v }); });
+      return res;
+    });
+  },
+  watch(name, cb) { return onSnapshot(doc(db, "shared", name), (s) => cb(J(s)), () => cb(undefined)); },
+  async saldo(cursoId, nombre) {
+    const d = await this.get(TP); if (!d) return null;
+    const c = (d.estudiantesPorCurso || []).find((c) => c.id === cursoId); const e = c && (c.estudiantes || []).find((e) => e.label === nombre);
+    return e ? (parseInt(String(e.price).replace(/[.\s]/g, ""), 10) || 0) : null;
   },
   async pay(cursoId, nombre, amount, motivo) {
     const ref = doc(db, "shared", TP), mref = doc(db, "shared", MOV);
@@ -3223,6 +3242,464 @@ async function adminDiagnostico() {
   await say(out.some((l) => l.includes("FALLÓ")) ? "Hay problemas de conexión: los terrapesos y comodines se guardarán en el celular y se enviarán cuando vuelva internet." : "¡Todo bien! Firebase responde.");
 }
 /* ============================================================
+   DUELOS EN VIVO entre estudiantes (se desbloquean con la medalla de la Casa VII)
+   · Apuesta única: 300 terrapesos cada uno; el ganador se lleva 600.
+   · Máximo 3 duelos al día por estudiante. Niveles iguales para todos (DUEL_LV).
+   · Cada jugador elige 3 filósofos. Turnos simultáneos: los dos eligen, responden su
+     pregunta y el turno se resuelve igual en ambos celulares (azar con semilla común).
+   Documentos (Firestore, colección "shared"):
+     filo_sala            { <key>: {n, c, t, inv?:{id, de, t}} }  quién está en la sala
+     filo_duelo_<id>      el duelo: jugadores, equipos, estado, acciones por turno
+     filo_duelos          { dias: {<fecha>: {<key>: n}}, log: [...] }  límite diario y registro
+   ============================================================ */
+const DUEL_APUESTA = 300, DUEL_MAX_DIA = 3, DUEL_LV = 40, DUEL_EQUIPO = 3;
+const DUEL_CFG = { dmg: 1.5 }; // multiplicador de daño para que un duelo dure ~10 turnos (ajustado con simulación)
+const DUEL_TURNO_MS = 90000;      // si el rival no juega en 90 s, pierde por abandono
+const DUEL_INVITA_MS = 90000;     // un reto sin respuesta caduca en 90 s (incluye elegir equipo)
+const SALA_VIVO_MS = 90000, SALA_LATIDO_MS = 30000;
+const hoyCL = () => { try { return new Date().toLocaleDateString("en-CA", { timeZone: "America/Santiago" }); } catch (e) { return new Date().toISOString().slice(0, 10); } };
+const duelosAbiertos = () => !!(S && S.medals && S.medals.includes(6)) && !!ID && !ID.admin;
+const otro = (s) => (s === "a" ? "b" : "a");
+const numTP = (p) => parseInt(String(p).replace(/[.\s]/g, ""), 10) || 0;
+const fmtTP = (n) => n.toLocaleString("es-CL");
+
+/* ---------- reglas de dinero (corren dentro de una transacción de Firestore) ---------- */
+function tpAjustar(d, cursoId, nombre, delta) {
+  let prev = null;
+  d.estudiantesPorCurso = (d.estudiantesPorCurso || []).map((c) => c.id !== cursoId ? c : { ...c, estudiantes: (c.estudiantes || []).map((e) => { if (e.label !== nombre) return e; prev = numTP(e.price); return { ...e, price: fmtTP(prev + delta) }; }) });
+  if (prev === null) throw new Error("no-estudiante");
+  return prev;
+}
+const cursoNombre = (d, id) => ((d.estudiantesPorCurso || []).find((c) => c.id === id) || {}).nombre || id;
+function movAgregar(D, lista, mov) { D[DB.MOV] = [mov, ...(Array.isArray(lista) ? lista : [])].slice(0, 150); }
+
+/* deposita la apuesta de los dos y deja el duelo "jugando" (todo o nada) */
+async function duelDepositar(id, teamB) {
+  const hoy = hoyCL();
+  return DB.txn([DB.TP, DB.MOV, "filo_duelos", "filo_duelo_" + id], (D) => {
+    const du = D["filo_duelo_" + id];
+    if (!du || du.estado !== "invitado") throw new Error("estado");
+    if (!D[DB.TP]) throw new Error("sin-datos");
+    if (Date.now() - du.t > DUEL_INVITA_MS + 15000) throw new Error("estado");
+    const reg = D.filo_duelos || {}; const dias = reg.dias || {}; const dia = { ...(dias[hoy] || {}) };
+    for (const s of ["a", "b"]) if ((dia[du[s].key] || 0) >= DUEL_MAX_DIA) throw new Error("limite-" + s);
+    for (const s of ["a", "b"]) { const p = du[s]; if (tpAjustar(D[DB.TP], p.curso, p.nombre, -DUEL_APUESTA) < DUEL_APUESTA) throw new Error("saldo-" + s); }
+    let lista = D[DB.MOV];
+    for (const s of ["a", "b"]) {
+      const p = du[s]; dia[p.key] = (dia[p.key] || 0) + 1;
+      lista = [{ t: new Date().toISOString(), curso: cursoNombre(D[DB.TP], p.curso), nombre: p.nombre, delta: -DUEL_APUESTA, motivo: "Filocaptura: apuesta de duelo contra " + du[otro(s)].nombre }, ...(Array.isArray(lista) ? lista : [])];
+    }
+    movAgregar(D, lista.slice(1), lista[0]);
+    D.filo_duelos = { dias: { [hoy]: dia }, log: [{ id, t: Date.now(), a: du.a.nombre, b: du.b.nombre, estado: "jugando" }, ...(reg.log || [])].slice(0, 100) };
+    D["filo_duelo_" + id] = { ...du, b: { ...du.b, team: teamB }, estado: "jugando", tStart: Date.now(), acts: { a: [], b: [] } };
+    return D["filo_duelo_" + id];
+  });
+}
+/* paga al ganador (una sola vez aunque lo pidan los dos celulares) */
+async function duelPagar(id, ganador, motivo, turno) {
+  return DB.txn([DB.TP, DB.MOV, "filo_duelos", "filo_duelo_" + id], (D) => {
+    const du = D["filo_duelo_" + id];
+    if (!du || du.estado !== "jugando") return du;
+    // por abandono solo si el rival de verdad no ha jugado ese turno
+    if (motivo === "abandono" && du.acts && du.acts[otro(ganador)] && du.acts[otro(ganador)][turno] != null) return du;
+    const w = du[ganador];
+    tpAjustar(D[DB.TP], w.curso, w.nombre, 2 * DUEL_APUESTA);
+    movAgregar(D, D[DB.MOV], { t: new Date().toISOString(), curso: cursoNombre(D[DB.TP], w.curso), nombre: w.nombre, delta: 2 * DUEL_APUESTA, motivo: "Filocaptura: ganó el duelo contra " + du[otro(ganador)].nombre + (motivo === "abandono" ? " (abandono)" : motivo === "rendicion" ? " (rendición)" : "") });
+    const reg = D.filo_duelos || { dias: {}, log: [] };
+    D.filo_duelos = { ...reg, log: (reg.log || []).map((l) => l.id === id ? { ...l, estado: "terminado", ganador: w.nombre, motivo } : l) };
+    D["filo_duelo_" + id] = { ...du, estado: "terminado", ganador, motivo, tEnd: Date.now() };
+    return D["filo_duelo_" + id];
+  });
+}
+/* el profesor devuelve la apuesta de un duelo trabado */
+async function duelDevolver(id) {
+  return DB.txn([DB.TP, DB.MOV, "filo_duelos", "filo_duelo_" + id], (D) => {
+    const du = D["filo_duelo_" + id];
+    if (!du || du.estado !== "jugando") throw new Error("estado");
+    let lista = D[DB.MOV];
+    for (const s of ["a", "b"]) {
+      tpAjustar(D[DB.TP], du[s].curso, du[s].nombre, DUEL_APUESTA);
+      lista = [{ t: new Date().toISOString(), curso: cursoNombre(D[DB.TP], du[s].curso), nombre: du[s].nombre, delta: DUEL_APUESTA, motivo: "Filocaptura: devolución de apuesta (duelo anulado por el profesor)" }, ...(Array.isArray(lista) ? lista : [])];
+    }
+    movAgregar(D, lista.slice(1), lista[0]);
+    const reg = D.filo_duelos || { dias: {}, log: [] };
+    D.filo_duelos = { ...reg, log: (reg.log || []).map((l) => l.id === id ? { ...l, estado: "devuelto" } : l) };
+    D["filo_duelo_" + id] = { ...du, estado: "devuelto", tEnd: Date.now() };
+    return true;
+  });
+}
+
+/* ---------- motor del combate: determinista (mismo resultado en los dos celulares) ---------- */
+function rngDe(seed) {
+  let h = 1779033703 ^ seed.length;
+  for (let i = 0; i < seed.length; i++) { h = Math.imul(h ^ seed.charCodeAt(i), 3432918353); h = (h << 13) | (h >>> 19); }
+  let a = h >>> 0;
+  return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function duelEstadoInicial(du) {
+  const L = {};
+  for (const s of ["a", "b"]) L[s] = { cur: 0, hp: du[s].team.map((id) => mhp({ id, lv: DUEL_LV })) };
+  return L;
+}
+const duelMon = (du, L, s) => ({ id: du[s].team[L[s].cur], lv: DUEL_LV });
+function duelResolver(du, L, r) {
+  const def0 = { k: "m", i: 0, s: 0.35 }, acts = { a: du.acts.a[r] || def0, b: du.acts.b[r] || def0 }, rng = rngDe(du.id + ":" + r), ev = [];
+  for (const s of ["a", "b"]) if (acts[s].k === "r") { ev.push({ t: "rinde", s }); return { ev, win: otro(s), motivo: "rendicion" }; }
+  for (const s of ["a", "b"]) { const w = acts[s]; if (w.k === "w" && w.to !== L[s].cur && L[s].hp[w.to] > 0) { L[s].cur = w.to; ev.push({ t: "cambio", s, to: w.to }); } }
+  const sa = stats(duelMon(du, L, "a")).spd, sb = stats(duelMon(du, L, "b")).spd;
+  const order = sa > sb ? ["a", "b"] : sb > sa ? ["b", "a"] : (rng() < 0.5 ? ["a", "b"] : ["b", "a"]);
+  const cayo = { a: false, b: false };
+  for (const s of order) {
+    const w = acts[s]; if (w.k !== "m" || cayo[s]) continue;
+    const o = otro(s), att = duelMon(du, L, s), def = duelMon(du, L, o);
+    const mv = DEX[att.id].moves[w.i] || DEX[att.id].moves[0];
+    const scale = mv[3] ? (w.s === 1 ? 1 : 0.35) : 1;
+    const A = stats(att), Df = stats(def), mult = typeMult(mv[1], DEX[def.id].type);
+    let dmg = Math.floor(((2 * att.lv / 5 + 2) * mv[2] * A.atk / Df.def) / 50) + 2;
+    if (DEX[att.id].type === mv[1]) dmg *= 1.25;
+    const crit = rng() < 1 / 16;
+    dmg = Math.max(1, Math.floor(Math.max(1, Math.floor(dmg * DUEL_CFG.dmg * mult * (crit ? 1.5 : 1) * (0.85 + rng() * 0.15))) * scale));
+    const hp = Math.max(0, L[o].hp[L[o].cur] - dmg); L[o].hp[L[o].cur] = hp;
+    ev.push({ t: "golpe", s, i: w.i, dmg, hp, mult, crit, q: mv[3] ? w.s === 1 : null });
+    if (hp <= 0) {
+      cayo[o] = true; ev.push({ t: "cae", s: o });
+      const next = L[o].hp.findIndex((h) => h > 0);
+      if (next < 0) return { ev, win: s, motivo: "combate" };
+      L[o].cur = next; ev.push({ t: "sale", s: o, to: next });
+    }
+  }
+  return { ev, win: null };
+}
+
+/* ---------- conexión en tiempo real ---------- */
+function duelWatch(name, onChange) {
+  let last = null, off = () => {};
+  try { off = DB.watch(name, (v) => { if (v !== undefined) { last = v; onChange && onChange(v); } }); } catch (e) {}
+  return { get: () => last, off: () => { try { off(); } catch (e) {} } };
+}
+async function waitFor(get, cond, ms, onTick) {
+  const t0 = Date.now();
+  for (;;) { const v = get(); if (cond(v)) return v; if (Date.now() - t0 > ms) return null; if (onTick) onTick(Date.now() - t0); await frames(10); }
+}
+
+/* ---------- sala de duelos ---------- */
+async function salaPresencia(estar) {
+  try {
+    await DB.txn(["filo_sala"], (D) => {
+      const sala = { ...(D.filo_sala || {}) }; const now = Date.now();
+      for (const k in sala) if (now - (sala[k].t || 0) > SALA_VIVO_MS * 3) delete sala[k];
+      if (estar) sala[ID.key] = { ...(sala[ID.key] || {}), n: ID.nombre, c: ID.curso, t: now }; else delete sala[ID.key];
+      D.filo_sala = sala;
+    });
+  } catch (e) {}
+}
+async function duelInfo() {
+  let saldo = null, hoy = 0;
+  try { saldo = await withTimeout(DB.saldo(ID.curso, ID.nombre), 6000); } catch (e) {}
+  try { const r = await withTimeout(DB.get("filo_duelos"), 6000); hoy = ((r && r.dias && r.dias[hoyCL()]) || {})[ID.key] || 0; } catch (e) {}
+  return { saldo, hoy };
+}
+async function elegirEquipo(titulo) {
+  const ids = [...new Set([...S.party, ...(S.box || [])].map((m) => m.id))].filter((id) => DEX[id] && !DEX[id].boss);
+  const elegidos = [];
+  if (ids.length < DUEL_EQUIPO) { await say("Necesitas al menos " + DUEL_EQUIPO + " filósofos distintos para un duelo. ¡Captura más!"); return null; }
+  await say("Elige " + DUEL_EQUIPO + " filósofos. En el duelo todos pelean al nivel " + DUEL_LV + ".", { auto: 40 });
+  while (elegidos.length < DUEL_EQUIPO) {
+    const libres = ids.filter((id) => !elegidos.includes(id));
+    const i = await pickFromList(titulo + " (" + (elegidos.length + 1) + "/" + DUEL_EQUIPO + ")", libres.map((id) => DEX[id].name + " · " + DEX[id].type));
+    if (i < 0) { if (!elegidos.length) return null; elegidos.pop(); continue; }
+    elegidos.push(libres[i]);
+  }
+  return elegidos;
+}
+const duelErrTxt = (e, du) => {
+  const m = String(e && e.message || e);
+  if (m === "saldo-a") return (du ? du.a.nombre : "El retador") + " no tiene " + DUEL_APUESTA + " terrapesos.";
+  if (m === "saldo-b") return (du ? du.b.nombre : "El retado") + " no tiene " + DUEL_APUESTA + " terrapesos.";
+  if (m === "limite-a") return (du ? du.a.nombre : "El retador") + " ya jugó " + DUEL_MAX_DIA + " duelos hoy.";
+  if (m === "limite-b") return (du ? du.b.nombre : "El retado") + " ya jugó " + DUEL_MAX_DIA + " duelos hoy.";
+  if (m === "estado") return "Ese reto ya no está disponible.";
+  if (m === "no-estudiante") return "No encontré a uno de los jugadores en la lista de terrapesos.";
+  return "No se pudo conectar. Intenta de nuevo.";
+};
+const corto = (n) => { const p = String(n).split(" "); return p.length > 2 ? p[0] + " " + p[p.length - 2] : n; };
+
+async function salaDuelos() {
+  if (!duelosAbiertos()) { await say("Los duelos se abren al ganar la Medalla de la Casa VII."); return; }
+  await ensureDB();
+  if (!DB || !DB.txn) { await say("Los duelos necesitan internet. Revisa tu conexión e intenta de nuevo."); return; }
+  await refreshCfg();
+  if (CFG.duelos === false) { await say("El profesor pausó los duelos por ahora."); return; }
+  ui.prompt = ["Entrando a la", "sala de duelos…"]; ui.promptW = 120;
+  let info = await duelInfo();
+  ui.prompt = null; ui.promptW = 236;
+  if (info.saldo === null) { await say("No pude leer tus terrapesos. Revisa la conexión."); return; }
+  await say("SALA DE DUELOS. Apuesta: " + DUEL_APUESTA + " terrapesos cada uno; el ganador se lleva " + (2 * DUEL_APUESTA) + ". Máximo " + DUEL_MAX_DIA + " duelos al día.");
+  const sala = duelWatch("filo_sala");
+  await salaPresencia(true);
+  let latido = Date.now(), vistos = new Set();
+  const sc = ui.screen = { kind: "sala", cur: 0, items: [], info };
+  try {
+    for (;;) {
+      if (Date.now() - latido > SALA_LATIDO_MS) { latido = Date.now(); salaPresencia(true); }
+      const sv = sala.get() || {}; const now = Date.now();
+      const otros = Object.keys(sv).filter((k) => k !== ID.key && now - (sv[k].t || 0) < SALA_VIVO_MS).sort((x, y) => sv[x].n.localeCompare(sv[y].n, "es"));
+      sc.items = [...otros.map((k) => ({ k, t: sv[k].n })), { k: "_salir", t: "SALIR DE LA SALA" }];
+      sc.cur = Math.min(sc.cur, sc.items.length - 1);
+      // ¿me llegó un reto?
+      const yo = sv[ID.key];
+      if (yo && yo.inv && !vistos.has(yo.inv.id) && now - yo.inv.t < DUEL_INVITA_MS) {
+        vistos.add(yo.inv.id); ui.screen = null;
+        const jugo = await recibirReto(yo.inv);
+        if (jugo) { info = await duelInfo(); await salaPresencia(true); }
+        ui.screen = sc; sc.info = info; continue;
+      }
+      const b = await waitOrTime(["up", "down", "a", "b"], 15);
+      if (b === "time") continue;
+      if (b === "up") { sc.cur = (sc.cur + sc.items.length - 1) % sc.items.length; SFX.move(); continue; }
+      if (b === "down") { sc.cur = (sc.cur + 1) % sc.items.length; SFX.move(); continue; }
+      if (b === "b") break;
+      SFX.select();
+      const it = sc.items[sc.cur]; if (!it || it.k === "_salir") break;
+      ui.screen = null;
+      if (info.hoy >= DUEL_MAX_DIA) await say("Ya jugaste tus " + DUEL_MAX_DIA + " duelos de hoy. ¡Vuelve mañana!");
+      else if (info.saldo < DUEL_APUESTA) await say("Necesitas al menos " + DUEL_APUESTA + " terrapesos para retar. Tienes " + fmtTP(info.saldo) + ".");
+      else {
+        const jugo = await enviarReto(it.k, sv[it.k]);
+        if (jugo) { info = await duelInfo(); await salaPresencia(true); }
+      }
+      ui.screen = sc; sc.info = info;
+    }
+  } finally {
+    ui.screen = null; sala.off(); salaPresencia(false);
+  }
+}
+async function enviarReto(key, p) {
+  await say("¿Retar a " + p.n + "? Apuestan " + DUEL_APUESTA + " terrapesos cada uno.");
+  if ((await menu(["NO", "SÍ, RETAR"], { x: 120, y: 84, w: 116, cancel: true })) !== 1) return false;
+  const team = await elegirEquipo("TU EQUIPO");
+  if (!team) return false;
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const du0 = { id, estado: "invitado", t: Date.now(), a: { key: ID.key, nombre: ID.nombre, curso: ID.curso, team }, b: { key, nombre: p.n, curso: p.c } };
+  try {
+    await DB.txn(["filo_duelo_" + id, "filo_sala"], (D) => {
+      const sala = { ...(D.filo_sala || {}) };
+      if (!sala[key]) throw new Error("estado");
+      sala[key] = { ...sala[key], inv: { id, de: ID.nombre, t: Date.now() } };
+      D.filo_sala = sala; D["filo_duelo_" + id] = du0;
+    });
+  } catch (e) { await say(e && e.message === "estado" ? p.n + " ya salió de la sala." : duelErrTxt(e)); return false; }
+  const w = duelWatch("filo_duelo_" + id);
+  try {
+    const du = await waitFor(w.get, (d) => d && d.estado !== "invitado", DUEL_INVITA_MS, (ms) => { ui.prompt = ["Esperando a", corto(p.n) + "… " + Math.ceil((DUEL_INVITA_MS - ms) / 1000) + "s"]; ui.promptW = 150; });
+    ui.prompt = null; ui.promptW = 236;
+    if (!du) {
+      let ok = false;
+      try { await DB.txn(["filo_duelo_" + id], (D) => { const d = D["filo_duelo_" + id]; if (d && d.estado === "invitado") { D["filo_duelo_" + id] = { ...d, estado: "caducado" }; ok = true; } }); } catch (e) {}
+      if (ok) { await say(p.n + " no respondió. El reto caducó."); return false; }
+      const d2 = await waitFor(w.get, (d) => d && d.estado !== "invitado", 8000);
+      if (!d2 || d2.estado !== "jugando") return false;
+      return await jugarDuelo(d2, "a", w);
+    }
+    if (du.estado === "rechazado") { await say(p.n + " rechazó el reto" + (du.razon ? ": " + du.razon : ".")); return false; }
+    if (du.estado !== "jugando") { await say("El reto no se concretó."); return false; }
+    return await jugarDuelo(du, "a", w);
+  } finally { w.off(); ui.prompt = null; ui.promptW = 236; }
+}
+async function recibirReto(inv) {
+  let du = null;
+  try { du = await withTimeout(DB.get("filo_duelo_" + inv.id), 6000); } catch (e) {}
+  if (!du || du.estado !== "invitado" || du.b.key !== ID.key) return false;
+  SFX.medal();
+  await say("¡" + du.a.nombre + " te reta a un duelo! Apuestan " + DUEL_APUESTA + " terrapesos cada uno.");
+  const r = await menu(["ACEPTAR", "RECHAZAR"], { x: 120, y: 84, w: 116, cancel: false });
+  const rechazar = async (razon) => { try { await DB.txn(["filo_duelo_" + inv.id], (D) => { const d = D["filo_duelo_" + inv.id]; if (d && d.estado === "invitado") D["filo_duelo_" + inv.id] = { ...d, estado: "rechazado", razon: razon || "" }; }); } catch (e) {} };
+  if (r !== 0) { await rechazar(); return false; }
+  const info = await duelInfo();
+  if (info.hoy >= DUEL_MAX_DIA) { await rechazar("ya jugó " + DUEL_MAX_DIA + " duelos hoy"); await say("Ya jugaste tus " + DUEL_MAX_DIA + " duelos de hoy."); return false; }
+  if (info.saldo < DUEL_APUESTA) { await rechazar("no tiene terrapesos suficientes"); await say("Necesitas " + DUEL_APUESTA + " terrapesos para aceptar. Tienes " + fmtTP(info.saldo) + "."); return false; }
+  const team = await elegirEquipo("TU EQUIPO");
+  if (!team) { await rechazar(); return false; }
+  ui.prompt = ["Depositando", "la apuesta…"]; ui.promptW = 110;
+  let dj = null;
+  try { dj = await duelDepositar(inv.id, team); } catch (e) { ui.prompt = null; ui.promptW = 236; await rechazar(); await say(duelErrTxt(e, du)); return false; }
+  ui.prompt = null; ui.promptW = 236;
+  const w = duelWatch("filo_duelo_" + inv.id);
+  try { return await jugarDuelo(dj, "b", w); } finally { w.off(); }
+}
+
+/* ---------- el combate en pantalla ---------- */
+async function duelMenuAccion(du, L, me) {
+  for (;;) {
+    ui.promptW = 118; ui.prompt = ["¿Qué hará", mname(bt.me) + "?"];
+    const r = await menu(["LUCHAR", "CAMBIAR", "RENDIRSE"], { x: 120, y: 120, w: 118, h: 38, cols: 2, cancel: false, lh: 12 });
+    ui.prompt = null; ui.promptW = 236;
+    if (r === 0) {
+      const mvs = DEX[bt.me.id].moves, foeT = DEX[bt.foe.id].type;
+      const mi = await menu(mvs.map((m) => ({ t: m[0], chip: TYPES[m[1]].col })), {
+        x: 56, y: 56, w: 182, h: 58, lh: 12, cancel: true,
+        onMove: (i) => { const m = mvs[i], mu = typeMult(m[1], foeT); ui.prompt = [`${m[1]}  POTENCIA ${m[2]}`, m[3] ? "Requiere pregunta" : "Ataque directo", mu > 1 ? "¡Muy eficaz!" : mu < 1 ? "Poco eficaz" : "Eficacia normal"]; },
+      });
+      ui.prompt = null;
+      if (mi < 0) continue;
+      let s = 1;
+      if (mvs[mi][3]) { const q = await ask(pickQ(bt.me.id), "¡Defiende tu argumento!"); s = q === true ? 1 : 0.35; await say(q === true ? "¡Correcto! Tu poder irá con toda su fuerza." : "Respuesta incorrecta: tu poder se debilita.", { auto: 26 }); }
+      return { k: "m", i: mi, s };
+    }
+    if (r === 1) {
+      const vivos = du[me].team.map((id, i) => ({ id, i })).filter((x) => x.i !== L[me].cur && L[me].hp[x.i] > 0);
+      if (!vivos.length) { await say("No te quedan otros filósofos.", { auto: 30 }); continue; }
+      const c = await menu([...vivos.map((x) => DEX[x.id].name + " " + L[me].hp[x.i] + "/" + mhp({ id: x.id, lv: DUEL_LV })), "VOLVER"], { x: 70, y: 40, w: 168, cancel: true });
+      if (c < 0 || c >= vivos.length) continue;
+      return { k: "w", to: vivos[c].i };
+    }
+    if (r === 2) { const c = await menu(["NO", "SÍ, ME RINDO"], { x: 120, y: 84, w: 116, cancel: true }); if (c === 1) return { k: "r" }; }
+  }
+}
+async function duelAnimar(du, me, mons, ev) {
+  const side = (s) => (s === me ? "me" : "foe");
+  const nom = (s) => mname(s === me ? bt.me : bt.foe) + (s === me ? "" : " de " + corto(du[s].nombre));
+  for (const e of ev) {
+    if (e.t === "rinde") { await say((e.s === me ? "Te rendiste." : du[e.s].nombre + " se rindió."), { auto: 40 }); }
+    else if (e.t === "cambio" || e.t === "sale") {
+      const m = mons[e.s][e.to];
+      if (e.s === me) { if (e.t === "cambio") { await say(`¡Vuelve, ${mname(bt.me)}!`, { auto: 20 }); for (let i = 1; i <= 10; i++) { bt.fx.meDx = -i * 10; await frames(1); } } bt.me = m; m.shown = m.hp; bt.fx.meClip = 1; bt.fx.meDx = -100; await say(`¡Adelante, ${mname(m)}!`, { auto: 22 }); await slideIn("me"); }
+      else { bt.foe = m; m.shown = m.hp; markSeen(m.id); bt.fx.foeClip = 1; bt.fx.foeDx = 130; await say(`${du[e.s].nombre} envía a ${mname(m)}.`, { auto: 24 }); await slideIn("foe"); }
+    } else if (e.t === "golpe") {
+      const att = e.s === me ? bt.me : bt.foe, def = e.s === me ? bt.foe : bt.me;
+      const mv = DEX[att.id].moves[e.i] || DEX[att.id].moves[0];
+      await say(`${nom(e.s)} usa ${mv[0]}!` + (e.q === true && e.s !== me ? " (¡respondió bien!)" : e.q === false && e.s !== me ? " (respondió mal)" : ""), { auto: 26 });
+      await lunge(side(e.s));
+      await hitFx(e.s === me ? "foe" : "me", TYPES[mv[1]].col, e.mult, mv[1]);
+      def.hp = e.hp; await tweenHp(def);
+      if (e.crit) await say("¡Golpe crítico!", { auto: 22 });
+      if (e.mult > 1) await say("¡Es muy eficaz!", { auto: 24 }); else if (e.mult < 1) await say("No es muy eficaz…", { auto: 24 });
+    } else if (e.t === "cae") {
+      SFX.faint(); const k = e.s === me ? "meClip" : "foeClip";
+      for (let i = 1; i <= 16; i++) { bt.fx[k] = 1 - i / 16; await frames(1); }
+      await say(`¡${nom(e.s)} se quedó sin argumentos!`, { auto: 30 });
+    }
+  }
+}
+async function jugarDuelo(du0, me, w) {
+  const op = otro(me), opNom = du0[op].nombre;
+  const mons = {}; for (const s of ["a", "b"]) mons[s] = du0[s].team.map((id) => { const m = { id, lv: DUEL_LV, xp: 0, hp: 0 }; m.hp = mhp(m); m.shown = m.hp; return m; });
+  let L = duelEstadoInicial(du0), r = 0, fin = null;
+  salaPresencia(false); // mientras pelea, nadie más lo puede retar
+  SFX.hit(); await wipeTo(1, 36);
+  mode = "battle";
+  bt = { cfg: { kind: "duelo", name: opNom, apuesta: DUEL_APUESTA }, foes: mons[op], fi: 0, foe: mons[op][0], me: mons[me][0], fx: null, ended: false };
+  resetFx(); bt.fx.foeDx = 130; bt.fx.meDx = -100; markSeen(bt.foe.id);
+  await wipeTo(0, 24);
+  try {
+    await slideIn("foe");
+    await say(`¡Duelo contra ${opNom}! ${fmtTP(2 * DUEL_APUESTA)} terrapesos en juego.`, { auto: 40 });
+    await say(`${opNom} envía a ${mname(bt.foe)}.`, { auto: 24 });
+    await say(`¡Adelante, ${mname(bt.me)}! (Tienes 1 minuto por turno.)`, { auto: 30 }); await slideIn("me");
+    for (;;) {
+      let du = w.get() || du0;
+      if (du.estado !== "jugando") { fin = du; break; }
+      const act = await duelMenuAccion(du0, L, me);
+      // enviar mi jugada del turno r
+      let enviado = false;
+      for (let intento = 0; intento < 4 && !enviado; intento++) {
+        try {
+          await DB.txn(["filo_duelo_" + du0.id], (D) => {
+            const d = D["filo_duelo_" + du0.id]; if (!d || d.estado !== "jugando") return;
+            const acts = { a: [...(d.acts && d.acts.a || [])], b: [...(d.acts && d.acts.b || [])] };
+            if (acts[me][r] == null) acts[me][r] = act;
+            D["filo_duelo_" + du0.id] = { ...d, acts };
+          });
+          enviado = true;
+        } catch (e) { await frames(60); }
+      }
+      // esperar la jugada del rival
+      const listo = (d) => d && (d.estado !== "jugando" || (d.acts && d.acts[op] && d.acts[op][r] != null && d.acts[me] && d.acts[me][r] != null));
+      for (;;) {
+        du = await waitFor(w.get, listo, DUEL_TURNO_MS, (ms) => { ui.prompt = ["Esperando a", corto(opNom) + "… " + Math.max(0, Math.ceil((DUEL_TURNO_MS - ms) / 1000)) + "s"]; ui.promptW = 150; });
+        ui.prompt = null; ui.promptW = 236;
+        if (du) break;
+        ui.prompt = ["Tu rival no", "responde…"]; ui.promptW = 110;
+        let c = null; try { c = await duelPagar(du0.id, me, "abandono", r); } catch (e) {}
+        ui.prompt = null; ui.promptW = 236;
+        if (c && c.estado !== "jugando") { du = c; break; }   // ganó por abandono
+        // si el rival alcanzó a jugar justo a tiempo, seguimos esperando el aviso
+      }
+      if (du.estado !== "jugando") { fin = du; break; }
+      const res = duelResolver(du, L, r);
+      await duelAnimar(du0, me, mons, res.ev);
+      if (res.win) {
+        try { fin = await duelPagar(du0.id, res.win, res.motivo); } catch (e) { fin = null; }
+        if (!fin || fin.estado === "jugando") fin = { ...du, estado: "terminado", ganador: res.win, motivo: res.motivo, pendiente: true };
+        break;
+      }
+      r++;
+    }
+    // resultado
+    const gane = fin && fin.estado === "terminado" && fin.ganador === me;
+    if (fin && fin.estado === "terminado") {
+      if (gane) { playJingle("win"); await say(`¡Ganaste el duelo! Recibes ${fmtTP(2 * DUEL_APUESTA)} terrapesos` + (fin.motivo === "abandono" ? " (tu rival abandonó)." : ".")); }
+      else { playJingle("lose"); await say(`Perdiste el duelo contra ${opNom}` + (fin.motivo === "abandono" ? " por no jugar a tiempo." : ".") + " ¡La próxima será!"); }
+      if (fin.pendiente) await say("(Hubo un problema de conexión al registrar el resultado. Si no ves el pago, avísale al profesor.)");
+    } else if (fin && fin.estado === "devuelto") await say("El profesor anuló este duelo y devolvió las apuestas.");
+    else await say("El duelo se interrumpió. Si perdiste terrapesos por un error, avísale al profesor.");
+    return true;
+  } finally {
+    await wipeTo(1, 24); mode = "world"; bt = null; ui.prompt = null; ui.text = null; ui.promptW = 236; await wipeTo(0, 24); clearInput();
+  }
+}
+function drawSala(sc) {
+  ctx.fillStyle = "#28324f"; ctx.fillRect(0, 0, W, H);
+  txt("SALA DE DUELOS", 8, 5, "#ffd86b");
+  const i = sc.info || {};
+  txt("Saldo " + (i.saldo == null ? "?" : fmtTP(i.saldo)) + " · hoy " + (i.hoy || 0) + "/" + DUEL_MAX_DIA, 232, 5, "#cfd6ee", { align: "right", max: 130 });
+  box(4, 16, 232, 112);
+  const otros = sc.items.length - 1;
+  if (!otros) wrapPx("Esperando compañeros… Pídele a alguien con la Medalla VII que entre a la sala.", 210).forEach((l, j) => txt(l, 14, 26 + j * 11, "#6a5a7a"));
+  const top = clamp(sc.cur - 4, 0, Math.max(0, sc.items.length - 8));
+  sc.items.slice(top, top + 8).forEach((it, j) => {
+    const k = top + j, y = (otros ? 22 : 70) + j * 13;
+    if (k === sc.cur) { ctx.fillStyle = "#fff0b8"; ctx.fillRect(7, y - 2, 226, 12); tri(9, y + 1); }
+    if (it.k !== "_salir") { ctx.fillStyle = "#3fbf5f"; ctx.fillRect(18, y + 2, 5, 5); }
+    txt(it.t, 28, y, it.k === "_salir" ? "#a02a3a" : COL.text, { max: 200 });
+  });
+  box(4, 130, 232, 28);
+  txt("A: retar · B: salir", 12, 136, COL.text);
+  txt("Apuesta " + DUEL_APUESTA + " c/u · el ganador se lleva " + 2 * DUEL_APUESTA, 12, 146, "#6a5a7a", { max: 218 });
+}
+
+/* ---------- panel del profesor ---------- */
+async function adminDuelos() {
+  await ensureDB();
+  if (!DB || !DB.txn) { await say("Sin conexión a la base de datos."); return; }
+  for (;;) {
+    await refreshCfg();
+    const on = CFG.duelos !== false;
+    const r = await menu([on ? "PAUSAR DUELOS" : "ACTIVAR DUELOS", "VER ÚLTIMOS DUELOS", "DUELOS TRABADOS", "VOLVER"], { x: 60, y: 50, w: 150, cancel: true });
+    if (r < 0 || r === 3) return;
+    if (r === 0) {
+      try { await DB.setConfig({ ...CFG, duelos: !on, t: Date.now() }); CFG.duelos = !on; SFX.heal(); await say(on ? "Duelos PAUSADOS. Nadie puede entrar a la sala." : "Duelos ACTIVADOS."); }
+      catch (e) { await say("No se pudo guardar."); }
+      continue;
+    }
+    let reg = null; try { reg = await withTimeout(DB.get("filo_duelos"), 8000); } catch (e) {}
+    const log = (reg && reg.log) || [];
+    const fecha = (t) => { const d = new Date(t); return d.toLocaleDateString("es-CL", { day: "2-digit", month: "2-digit" }) + " " + d.toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" }); };
+    if (r === 1) {
+      if (!log.length) { await say("Todavía no hay duelos."); continue; }
+      await pickFromList("ÚLTIMOS DUELOS (" + log.length + ")", log.map((l) => fecha(l.t) + " " + corto(l.a) + " vs " + corto(l.b) + " · " + (l.estado === "terminado" ? "ganó " + corto(l.ganador) + (l.motivo === "abandono" ? " (aband.)" : l.motivo === "rendicion" ? " (rindió)" : "") : l.estado === "devuelto" ? "devuelto" : "en curso")));
+      continue;
+    }
+    const trab = log.filter((l) => l.estado === "jugando" && Date.now() - l.t > 10 * 60000);
+    if (!trab.length) { await say("No hay duelos trabados. (Un duelo cuenta como trabado si lleva más de 10 minutos sin terminar.)"); continue; }
+    const i = await pickFromList("DEVOLVER APUESTA", trab.map((l) => fecha(l.t) + " " + corto(l.a) + " vs " + corto(l.b)));
+    if (i < 0) continue;
+    await say("¿Devolver " + DUEL_APUESTA + " terrapesos a cada uno (" + trab[i].a + " y " + trab[i].b + ")?");
+    if ((await menu(["NO", "SÍ, DEVOLVER"], { x: 108, y: 84, w: 128, cancel: true })) !== 1) continue;
+    try { await duelDevolver(trab[i].id); SFX.heal(); await say("Apuestas devueltas."); } catch (e) { await say("No se pudo: " + duelErrTxt(e)); }
+  }
+}
+/* ============================================================
    INTERFAZ: cajas, texto, menús, preguntas con temporizador
    ============================================================ */
 const ui = { toasts: [], text: null, prompt: null, promptW: 236, menu: null, q: null, screen: null, banner: null, wipe: 0, fade: 0, bubble: null, flash: 0 };
@@ -3709,7 +4186,7 @@ function keyHash(s) {
   return ((h2 >>> 0).toString(36) + (h1 >>> 0).toString(36));
 }
 async function ensureDB() { if (DB) return DB; try { const a = await withTimeout(window.FILO_READY || Promise.resolve(null), 15000); if (a) DB = a; } catch (e) {} return DB; }
-async function refreshCfg() { await ensureDB(); if (DB && DB.getConfig) { try { const c = await withTimeout(DB.getConfig(), 5000); if (c && c.gates) CFG = c; } catch (e) {} } }
+async function refreshCfg() { await ensureDB(); if (DB && DB.getConfig) { try { const c = await withTimeout(DB.getConfig(), 5000); if (c) CFG = { gates: {}, ...c }; } catch (e) {} } }
 async function keyEntry(title) {
   const rows = ["ABCDEFGHIJ", "KLMNÑOPQRS", "TUVWXYZ012", "3456789 <+"];
   const sc = ui.screen = { kind: "keypad", title, s: "", r: 0, c: 0, rows };
@@ -3772,7 +4249,7 @@ async function adminKeys() {
     if (c !== 1) continue;
     await ensureDB();
     if (!DB || !DB.setConfig) { await say("Sin conexión a la base de datos. Abre el juego desde la página publicada (no desde la vista previa del chat) y con internet. Si el colegio bloquea «gstatic.com» o «firebase», no funcionará."); continue; }
-    try { const g = { ...(CFG.gates || {}), [n]: keyHash(k) }; await DB.setConfig({ gates: g, t: Date.now() }); CFG = { gates: g }; SFX.heal(); await say("Clave de la puerta " + n + " guardada: " + normKey(k) + ". Anótala: no se puede ver después."); }
+    try { const g = { ...(CFG.gates || {}), [n]: keyHash(k) }; await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal(); await say("Clave de la puerta " + n + " guardada: " + normKey(k) + ". Anótala: no se puede ver después."); }
     catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
   }
 }
@@ -4091,19 +4568,22 @@ async function runBattle(cfg) {
 async function pauseMenu() {
   SFX.select();
   for (;;) {
-    const opts = ["EQUIPO", "FILOSOFODEX", "MEDALLAS", "LOGROS", "MISIONES", "GUARDAR", "SONIDO: " + (SOUND_ON ? "SÍ" : "NO"), "CERRAR"];
-    if (S.flags.comodin || S.flags.final) opts.splice(4, 0, "COMODÍN");
-    let r = await menu(opts, { x: 124, y: 4, w: 112 });
-    if (opts[r] === "COMODÍN") { await comodinScreen(); continue; }
-    if (r > 4 && opts.length > 8) r--;
-    if (r === -1 || r === 7) break;
-    if (r === 0) await partyScreen(false);
-    if (r === 1) await dexScreen();
-    if (r === 2) await medalsScreen();
-    if (r === 3) await logrosScreen();
-    if (r === 4) await questsScreen();
-    if (r === 5) { saveGame(); cloudSave(); SFX.heal(); await say("¡Partida guardada!"); }
-    if (r === 6) { SOUND_ON = !SOUND_ON; try { localStorage.setItem("filosofos-sound", SOUND_ON ? "1" : "0"); } catch (e) {} SFX.select(); }
+    const opts = ["EQUIPO", "FILOSOFODEX", "MEDALLAS", "LOGROS"];
+    if (S.flags.comodin || S.flags.final) opts.push("COMODÍN");
+    if (duelosAbiertos()) opts.push("DUELOS");
+    opts.push("MISIONES", "GUARDAR", "SONIDO: " + (SOUND_ON ? "SÍ" : "NO"), "CERRAR");
+    const r = await menu(opts, { x: 124, y: 4, w: 112 });
+    const o = opts[r];
+    if (r === -1 || o === "CERRAR") break;
+    if (o === "EQUIPO") await partyScreen(false);
+    else if (o === "FILOSOFODEX") await dexScreen();
+    else if (o === "MEDALLAS") await medalsScreen();
+    else if (o === "LOGROS") await logrosScreen();
+    else if (o === "COMODÍN") await comodinScreen();
+    else if (o === "DUELOS") { await salaDuelos(); break; }
+    else if (o === "MISIONES") await questsScreen();
+    else if (o === "GUARDAR") { saveGame(); cloudSave(); SFX.heal(); await say("¡Partida guardada!"); }
+    else if (o.startsWith("SONIDO")) { SOUND_ON = !SOUND_ON; try { localStorage.setItem("filosofos-sound", SOUND_ON ? "1" : "0"); } catch (e) {} SFX.select(); }
   }
   clearInput();
 }
@@ -4412,6 +4892,7 @@ function drawBattle() {
   txt(Math.ceil(m.shown) + "/" + mhp(m), 228, 97, COL.text, { align: "right" });
   ctx.fillStyle = COL.ink; ctx.fillRect(128, 107, 100, 4); ctx.fillStyle = "#4aa0ff"; ctx.fillRect(129, 108, Math.round(98 * clamp(m.xp / need(m.lv), 0, 1)), 2);
   if (k === "boss") txt("JEFE · CASA " + (bt.cfg.casa || "I"), 104, 58, "#a02a3a", { shadow: "#fff" });
+  if (k === "duelo") txt("DUELO · " + (2 * bt.cfg.apuesta) + " TP EN JUEGO", 104, 58, "#a02a3a", { shadow: "#fff" });
 }
 function drawPartyScreen(sc) {
   ctx.fillStyle = "#28324f"; ctx.fillRect(0, 0, W, H);
@@ -4587,7 +5068,7 @@ function drawAll() {
   ctx.clearRect(0, 0, W, H);
   if (mode === "title") drawTitle(); else if (mode === "battle" && bt) drawBattle(); else if (S) drawWorld();
   const sc = ui.screen;
-  if (sc) { if (sc.kind === "party") drawPartyScreen(sc); else if (sc.kind === "dex") drawDex(sc); else if (sc.kind === "medals") drawMedals(sc); else if (sc.kind === "starter") drawStarter(sc); else if (sc.kind === "list") drawList(sc); else if (sc.kind === "pin") drawPin(sc); else if (sc.kind === "keypad") drawKeypad(sc); else if (sc.kind === "logros") drawLogros(sc); else if (sc.kind === "medal") drawMedalCeremony(sc); else if (sc.kind === "comodin") drawComodinScreen(sc); else if (sc.kind === "comodinC") drawComodinCeremony(sc); }
+  if (sc) { if (sc.kind === "party") drawPartyScreen(sc); else if (sc.kind === "dex") drawDex(sc); else if (sc.kind === "medals") drawMedals(sc); else if (sc.kind === "starter") drawStarter(sc); else if (sc.kind === "list") drawList(sc); else if (sc.kind === "pin") drawPin(sc); else if (sc.kind === "keypad") drawKeypad(sc); else if (sc.kind === "logros") drawLogros(sc); else if (sc.kind === "medal") drawMedalCeremony(sc); else if (sc.kind === "comodin") drawComodinScreen(sc); else if (sc.kind === "sala") drawSala(sc); else if (sc.kind === "comodinC") drawComodinCeremony(sc); }
   if (ui.banner) { const t = tick - ui.banner.t0; if (t > 150) ui.banner = null; else { const y = t < 12 ? -20 + t * 2 : t > 138 ? -20 + (150 - t) * 2 : 4; box(4, y, Math.ceil(tw(ui.banner.t)) + 18, 18); txt(ui.banner.t, 13, y + 6); } }
   drawToast();
   if (ui.prompt) { box(2, 120, ui.promptW, 38); ui.prompt.forEach((l, i) => txt(l, 10, 126 + i * 11)); }
@@ -4643,7 +5124,7 @@ async function titleScreen() {
     if (!(await identify())) { ID = null; continue; }
     await loadProfile();
     for (;;) {
-      const opts = []; if (hasSave()) opts.push("CONTINUAR"); opts.push("NUEVO JUEGO", "MIS LOGROS"); if (!ID.admin && comodinGanado()) opts.push("MI COMODÍN"); if (ID.admin) opts.push("COMODINES", "CLAVES DE PUERTAS", "REINICIAR ALUMNO", "PROBAR CONEXIÓN"); opts.push("CAMBIAR JUGADOR");
+      const opts = []; if (hasSave()) opts.push("CONTINUAR"); opts.push("NUEVO JUEGO", "MIS LOGROS"); if (!ID.admin && comodinGanado()) opts.push("MI COMODÍN"); if (ID.admin) opts.push("COMODINES", "DUELOS", "CLAVES DE PUERTAS", "REINICIAR ALUMNO", "PROBAR CONEXIÓN"); opts.push("CAMBIAR JUGADOR");
       const r = await menu(opts, { x: 52, y: opts.length > 4 ? Math.max(4, 150 - (opts.length * 12 + 10)) : 84, w: 136, cancel: false });
       const choice = opts[r];
       if (choice === "CONTINUAR") { if (loadGame()) { await fadeTo(1, 12); await startGame(false); return; } }
@@ -4655,6 +5136,7 @@ async function titleScreen() {
       else if (choice === "REINICIAR ALUMNO") await resetStudent();
       else if (choice === "MI COMODÍN") await comodinScreen();
       else if (choice === "COMODINES") await adminComodines();
+      else if (choice === "DUELOS") await adminDuelos();
       else if (choice === "PROBAR CONEXIÓN") await adminDiagnostico();
       else if (choice === "CLAVES DE PUERTAS") await adminKeys();
       else { try { localStorage.removeItem("filosofos-id"); } catch (e) {} ID = null; break; }
@@ -4678,7 +5160,7 @@ function frame(ts) {
 }
 function wantTrack() {
   if (mode === "title" || !S) return "title";
-  if (mode === "battle" && bt) { const c = bt.cfg; if (c.kind === "boss") return c.name === "Sócrates" ? "socrates" : c.name === "Platón" ? "platon" : "boss"; if (c.kind === "trainer") return "trainer"; return "battle"; }
+  if (mode === "battle" && bt) { const c = bt.cfg; if (c.kind === "boss") return c.name === "Sócrates" ? "socrates" : c.name === "Platón" ? "platon" : "boss"; if (c.kind === "trainer") return "trainer"; if (c.kind === "duelo") return "boss"; return "battle"; }
   return MAPMUS[S.map] || "town";
 }
 function musicUpdate() {
@@ -4690,7 +5172,7 @@ function musicUpdate() {
 }
 function boot() {
   makeTiles();
-  window.__FILO = { ui, get S() { return S; }, P, get mode() { return mode; }, get bt() { return bt; }, input, press, get MAPS() { return MAPS; }, get DEX() { return DEX; }, get QUESTS() { return QUESTS; }, get ID() { return ID; }, runBattle, mhp, stats, t: { bossProfesor, comodinCeremony, comodinScreen, syncComodin, adminComodines, get COMODIN() { return COMODIN; }, get ACH() { return ACH; }, mkMon, calcDmg, typeMult, MEDALS } };
+  window.__FILO = { ui, get S() { return S; }, P, get mode() { return mode; }, get bt() { return bt; }, input, press, get MAPS() { return MAPS; }, get DEX() { return DEX; }, get QUESTS() { return QUESTS; }, get ID() { return ID; }, runBattle, mhp, stats, t: { bossProfesor, comodinCeremony, comodinScreen, syncComodin, adminComodines, get COMODIN() { return COMODIN; }, duelResolver, duelEstadoInicial, DUEL_CFG, salaDuelos, adminDuelos, get ACH() { return ACH; }, mkMon, calcDmg, typeMult, MEDALS } };
   requestAnimationFrame(frame);
   titleScreen();
 }
