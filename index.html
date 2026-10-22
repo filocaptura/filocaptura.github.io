@@ -4212,7 +4212,7 @@ async function gatePass(n) {
   if (S.flags["gate" + n]) return true;
   if (ID && ID.admin) { S.flags["gate" + n] = true; await say("(Modo admin: la puerta se abre sola.)"); return true; }
   await refreshCfg();
-  const custom = !!(CFG.gates && CFG.gates[n]);
+  const custom = !!(CFG.gates && CFG.gates[n] && CFG.gates[n] !== GATE_DEFAULT[n]); // misma clave original = mismo acertijo del juego
   const rid = !custom && GATE_RIDDLES[n];
   if (rid) await say("Un guardia te detiene: «Este camino está cerrado. Solo pasa quien resuelve mi ACERTIJO. Su respuesta es la clave.»");
   else await say("Un guardia te detiene: «Este camino está cerrado. Solo pasa quien conoce la CLAVE. Tu profesor te dará un acertijo: su respuesta es la clave.»");
@@ -4233,24 +4233,40 @@ async function gatePass(n) {
 }
 async function adminKeys() {
   await refreshCfg();
+  const propia = (n) => !!(CFG.gates && CFG.gates[n] && CFG.gates[n] !== GATE_DEFAULT[n]);
   for (;;) {
     const GN = Math.min(CASAS_LISTAS, 12);
-    const opts = Array.from({ length: GN }, (_, i) => i + 1).map((n) => "PUERTA " + n + (CFG.gates && CFG.gates[n] ? " ·propia" : " ·inicial")); opts.push("VOLVER");
+    const opts = Array.from({ length: GN }, (_, i) => i + 1).map((n) => "PUERTA " + n + (propia(n) ? " ·propia" : " ·acertijo"));
+    opts.push("VOLVER");
     ui.prompt = ["Puerta", "a editar"]; ui.promptW = 80;
-    const r = await menu(opts, { x: 70, y: 40, w: 160, cancel: true });
+    const r = await menu(opts, { x: 70, y: 4, w: 160, cancel: true });
     ui.prompt = null; ui.promptW = 236;
     if (r < 0 || r >= GN) return;
-    const n = r + 1;
-    await say("Puerta " + n + ": " + GATE_NAMES[n] + ". Escribe la nueva clave (la respuesta de tu acertijo).");
+    const n = r + 1, rid = GATE_RIDDLES[n];
+    if (propia(n)) await say("Puerta " + n + " (" + GATE_NAMES[n] + "): tiene una clave propia, así que el guardia NO muestra acertijo; tú se lo das a tus alumnos.");
+    else await say("Puerta " + n + " (" + GATE_NAMES[n] + "): el guardia muestra este acertijo: «" + rid.r + "» Pista: " + rid.h);
+    const c0 = await menu(propia(n) ? ["VOLVER AL ACERTIJO", "CAMBIAR CLAVE", "VOLVER"] : ["CAMBIAR CLAVE", "VOLVER"], { x: 100, y: 70, w: 136, cancel: true });
+    const accion = c0 < 0 ? "VOLVER" : (propia(n) ? ["VOLVER AL ACERTIJO", "CAMBIAR CLAVE", "VOLVER"] : ["CAMBIAR CLAVE", "VOLVER"])[c0];
+    if (accion === "VOLVER") continue;
+    await ensureDB();
+    if (!DB || !DB.setConfig) { await say("Sin conexión a la base de datos. Abre el juego desde la página publicada (no desde la vista previa del chat) y con internet. Si el colegio bloquea «gstatic.com» o «firebase», no funcionará."); continue; }
+    if (accion === "VOLVER AL ACERTIJO") {
+      try { const g = { ...(CFG.gates || {}) }; delete g[n]; await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal(); await say("Listo: la puerta " + n + " vuelve a su acertijo del juego (respuesta original)."); }
+      catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
+      continue;
+    }
+    await say("Escribe la nueva clave. Ojo: si es distinta de la original, el guardia dejará de mostrar el acertijo del juego y tendrás que darles tú el acertijo.");
     const k = await keyEntry("NUEVA CLAVE PUERTA " + n);
     if (k === null || !normKey(k)) continue;
     await say("¿Cambiar la clave de la puerta " + n + " a «" + normKey(k) + "»?");
     const c = await menu(["NO", "SÍ, CAMBIAR"], { x: 108, y: 84, w: 128, cancel: true });
     if (c !== 1) continue;
-    await ensureDB();
-    if (!DB || !DB.setConfig) { await say("Sin conexión a la base de datos. Abre el juego desde la página publicada (no desde la vista previa del chat) y con internet. Si el colegio bloquea «gstatic.com» o «firebase», no funcionará."); continue; }
-    try { const g = { ...(CFG.gates || {}), [n]: keyHash(k) }; await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal(); await say("Clave de la puerta " + n + " guardada: " + normKey(k) + ". Anótala: no se puede ver después."); }
-    catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
+    try {
+      const h = keyHash(k), g = { ...(CFG.gates || {}) };
+      if (h === GATE_DEFAULT[n]) delete g[n]; else g[n] = h;
+      await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal();
+      await say(h === GATE_DEFAULT[n] ? "Esa es la clave original: la puerta " + n + " sigue mostrando su acertijo del juego." : "Clave de la puerta " + n + " guardada: " + normKey(k) + ". Anótala: no se puede ver después.");
+    } catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
   }
 }
 async function roadTo(k) {
@@ -5172,7 +5188,7 @@ function musicUpdate() {
 }
 function boot() {
   makeTiles();
-  window.__FILO = { ui, get S() { return S; }, P, get mode() { return mode; }, get bt() { return bt; }, input, press, get MAPS() { return MAPS; }, get DEX() { return DEX; }, get QUESTS() { return QUESTS; }, get ID() { return ID; }, runBattle, mhp, stats, t: { bossProfesor, comodinCeremony, comodinScreen, syncComodin, adminComodines, get COMODIN() { return COMODIN; }, duelResolver, duelEstadoInicial, DUEL_CFG, salaDuelos, adminDuelos, get ACH() { return ACH; }, mkMon, calcDmg, typeMult, MEDALS } };
+  window.__FILO = { ui, get S() { return S; }, P, get mode() { return mode; }, get bt() { return bt; }, input, press, get MAPS() { return MAPS; }, get DEX() { return DEX; }, get QUESTS() { return QUESTS; }, get ID() { return ID; }, runBattle, mhp, stats, t: { bossProfesor, comodinCeremony, comodinScreen, syncComodin, adminComodines, get COMODIN() { return COMODIN; }, duelResolver, duelEstadoInicial, DUEL_CFG, gatePass, salaDuelos, adminDuelos, get ACH() { return ACH; }, mkMon, calcDmg, typeMult, MEDALS } };
   requestAnimationFrame(frame);
   titleScreen();
 }
