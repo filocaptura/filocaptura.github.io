@@ -4306,10 +4306,9 @@ async function gatePass(n) {
   if (S.flags["gate" + n]) return true;
   if (ID && ID.admin) { S.flags["gate" + n] = true; await say("(Modo admin: la puerta se abre sola.)"); return true; }
   await refreshCfg();
-  const custom = !!(CFG.gates && CFG.gates[n] && CFG.gates[n] !== GATE_DEFAULT[n]); // misma clave original = mismo acertijo del juego
-  const rid = !custom && GATE_RIDDLES[n];
+  const rid = GATE_RIDDLES[n]; // el acertijo siempre está en el juego
   if (rid) await say("Un guardia te detiene: «Este camino está cerrado. Solo pasa quien resuelve mi ACERTIJO. Su respuesta es la clave.»");
-  else await say("Un guardia te detiene: «Este camino está cerrado. Solo pasa quien conoce la CLAVE. Tu profesor te dará un acertijo: su respuesta es la clave.»");
+  else await say("Un guardia te detiene: «Este camino está cerrado. Solo pasa quien conoce la CLAVE.»");
   if (rid) await say("Guardia: «" + rid.r + "»");
   for (;;) {
     const opts = rid ? ["DECIR LA CLAVE", "VER ACERTIJO", "VER PISTA", "VOLVER"] : ["DECIR LA CLAVE", "VOLVER"];
@@ -4320,8 +4319,8 @@ async function gatePass(n) {
     const k = await keyEntry("CLAVE DE LA PUERTA");
     if (k === null || !normKey(k)) continue;
     await refreshCfg();
-    const want = (CFG.gates && CFG.gates[n]) || GATE_DEFAULT[n];
-    if (keyHash(k) === want) { S.flags["gate" + n] = true; SFX.capture(); await say("Guardia: «Correcto. El camino se abre. ¡Adelante, filósofo!»"); saveGame(); return true; }
+    const h = keyHash(k), propia = CFG.gates && CFG.gates[n];
+    if (h === GATE_DEFAULT[n] || (propia && h === propia)) { S.flags["gate" + n] = true; SFX.capture(); await say("Guardia: «Correcto. El camino se abre. ¡Adelante, filósofo!»"); saveGame(); return true; }
     SFX.miss(); await say("Guardia: «Esa no es la clave. Piénsalo mejor…»");
   }
 }
@@ -4330,36 +4329,35 @@ async function adminKeys() {
   const propia = (n) => !!(CFG.gates && CFG.gates[n] && CFG.gates[n] !== GATE_DEFAULT[n]);
   for (;;) {
     const GN = Math.min(CASAS_LISTAS, 12);
-    const opts = Array.from({ length: GN }, (_, i) => i + 1).map((n) => "PUERTA " + n + (propia(n) ? " ·propia" : " ·acertijo"));
+    const opts = Array.from({ length: GN }, (_, i) => i + 1).map((n) => "PUERTA " + n + (propia(n) ? " ·acertijo + extra" : " ·acertijo"));
     opts.push("VOLVER");
     ui.prompt = ["Puerta", "a editar"]; ui.promptW = 80;
     const r = await menu(opts, { x: 70, y: 4, w: 160, cancel: true });
     ui.prompt = null; ui.promptW = 236;
     if (r < 0 || r >= GN) return;
     const n = r + 1, rid = GATE_RIDDLES[n];
-    if (propia(n)) await say("Puerta " + n + " (" + GATE_NAMES[n] + "): tiene una clave propia, así que el guardia NO muestra acertijo; tú se lo das a tus alumnos.");
-    else await say("Puerta " + n + " (" + GATE_NAMES[n] + "): el guardia muestra este acertijo: «" + rid.r + "» Pista: " + rid.h);
-    const c0 = await menu(propia(n) ? ["VOLVER AL ACERTIJO", "CAMBIAR CLAVE", "VOLVER"] : ["CAMBIAR CLAVE", "VOLVER"], { x: 100, y: 70, w: 136, cancel: true });
-    const accion = c0 < 0 ? "VOLVER" : (propia(n) ? ["VOLVER AL ACERTIJO", "CAMBIAR CLAVE", "VOLVER"] : ["CAMBIAR CLAVE", "VOLVER"])[c0];
+    await say("Puerta " + n + " (" + GATE_NAMES[n] + "): el guardia muestra este acertijo: «" + rid.r + "» Pista: " + rid.h + (propia(n) ? " Además acepta tu clave extra." : ""));
+    const c0 = await menu(propia(n) ? ["QUITAR CLAVE EXTRA", "CAMBIAR CLAVE EXTRA", "VOLVER"] : ["AGREGAR CLAVE EXTRA", "VOLVER"], { x: 100, y: 70, w: 136, cancel: true });
+    const accion = c0 < 0 ? "VOLVER" : (propia(n) ? ["VOLVER AL ACERTIJO", "CAMBIAR CLAVE", "VOLVER"] : ["CAMBIAR CLAVE", "VOLVER"])[c0]; // (mismas acciones, nombres nuevos)
     if (accion === "VOLVER") continue;
     await ensureDB();
     if (!DB || !DB.setConfig) { await say("Sin conexión a la base de datos. Abre el juego desde la página publicada (no desde la vista previa del chat) y con internet. Si el colegio bloquea «gstatic.com» o «firebase», no funcionará."); continue; }
     if (accion === "VOLVER AL ACERTIJO") {
-      try { const g = { ...(CFG.gates || {}) }; delete g[n]; await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal(); await say("Listo: la puerta " + n + " vuelve a su acertijo del juego (respuesta original)."); }
+      try { const g = { ...(CFG.gates || {}) }; delete g[n]; await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal(); await say("Listo: la puerta " + n + " acepta solo la respuesta de su acertijo."); }
       catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
       continue;
     }
-    await say("Escribe la nueva clave. Ojo: si es distinta de la original, el guardia dejará de mostrar el acertijo del juego y tendrás que darles tú el acertijo.");
-    const k = await keyEntry("NUEVA CLAVE PUERTA " + n);
+    await say("Escribe una clave extra. El guardia seguirá mostrando el acertijo del juego y aceptará tanto su respuesta como esta clave.");
+    const k = await keyEntry("CLAVE EXTRA PUERTA " + n);
     if (k === null || !normKey(k)) continue;
-    await say("¿Cambiar la clave de la puerta " + n + " a «" + normKey(k) + "»?");
-    const c = await menu(["NO", "SÍ, CAMBIAR"], { x: 108, y: 84, w: 128, cancel: true });
+    await say("¿Agregar «" + normKey(k) + "» como clave extra de la puerta " + n + "?");
+    const c = await menu(["NO", "SÍ, AGREGAR"], { x: 108, y: 84, w: 128, cancel: true });
     if (c !== 1) continue;
     try {
       const h = keyHash(k), g = { ...(CFG.gates || {}) };
       if (h === GATE_DEFAULT[n]) delete g[n]; else g[n] = h;
       await DB.setConfig({ ...CFG, gates: g, t: Date.now() }); CFG = { ...CFG, gates: g }; SFX.heal();
-      await say(h === GATE_DEFAULT[n] ? "Esa es la clave original: la puerta " + n + " sigue mostrando su acertijo del juego." : "Clave de la puerta " + n + " guardada: " + normKey(k) + ". Anótala: no se puede ver después.");
+      await say(h === GATE_DEFAULT[n] ? "Esa ya es la respuesta del acertijo: no hace falta agregarla." : "Clave extra de la puerta " + n + " guardada: " + normKey(k) + ". Anótala: no se puede ver después.");
     } catch (e) { await say("No se pudo guardar. Intenta de nuevo."); }
   }
 }
@@ -4596,7 +4594,7 @@ async function bossHeraclito(n) {
   if (r === "win") {
     await medalCeremony(0);
     await say("Heráclito: «El camino hacia arriba y hacia abajo es uno y el mismo.» Ve, aprendiz. Que la siguiente Casa te sorprenda.");
-    await say("¡Se abrió el camino al este! Sal de Mileto y sigue la Ruta 2 hasta Atenas, sede de la Casa II. Pero el guardia de la salida exige una CLAVE: pregúntale a tu profesor.");
+    await say("¡Se abrió el camino al este! Sal de Mileto y sigue la Ruta 2 hasta Atenas, sede de la Casa II. El guardia de la salida te dará un ACERTIJO: su respuesta es la clave.");
     saveGame();
   } else if (r === "lose") await whiteout();
 }
@@ -4616,7 +4614,7 @@ async function bossSocrates(n) {
   if (r === "win") {
     await medalCeremony(1);
     await say("Sócrates: «Solo sé que no sé nada.» Pero tú sabes un poco más que al llegar. Que la Casa III te reciba bien.");
-    await say("¡Se abrió el camino al este de Atenas, hacia la Academia de Platón! El guardia pedirá una CLAVE: pregúntale a tu profesor.");
+    await say("¡Se abrió el camino al este de Atenas, hacia la Academia de Platón! El guardia te dará un ACERTIJO: su respuesta es la clave.");
     saveGame();
   } else if (r === "lose") await whiteout();
 }
@@ -4636,7 +4634,7 @@ async function bossPlaton(n) {
   if (r === "win") {
     await medalCeremony(2);
     await say("Platón: «Quien ha salido de la caverna no puede dejar de ayudar a los que siguen dentro.» Enseña lo que has aprendido.");
-    await say("¡Fin de la Casa III! La Casa IV (Aristóteles) llegará pronto; su puerta también pedirá una CLAVE.");
+    await say("¡Se abrió el camino hacia el Liceo de Aristóteles, la Casa IV! El guardia te dará un ACERTIJO: su respuesta es la clave.");
     saveGame();
   } else if (r === "lose") await whiteout();
 }
