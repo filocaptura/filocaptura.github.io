@@ -47,6 +47,7 @@ html,body{margin:0;height:100%;background:#0d0b1a;color:#fff;font-family:"Press 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
 import { getFirestore, doc, getDoc, setDoc, runTransaction, onSnapshot } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
 const app = initializeApp({
   apiKey: "AIzaSyD6QGZ8-0kTadVXxEPavR0fUm_8XD1vqEQ",
   authDomain: "deusivenatura-b042b.firebaseapp.com",
@@ -56,6 +57,15 @@ const app = initializeApp({
   appId: "1:854823557109:web:68b241193ead69a55572bc",
 });
 const db = getFirestore(app);
+/* ---------- inicio de sesión con Google (mismo esquema que Deusivenatura) ---------- */
+// Dominio del correo institucional (sin @). Ej.: "colegio.cl". Vacío = se acepta cualquier cuenta Google.
+const DOMINIO_INSTITUCIONAL = "";
+const auth = getAuth(app);
+let gUser = null, gListo; const gPrimera = new Promise((r) => { gListo = r; });
+onAuthStateChanged(auth, (u) => { gUser = u || null; gListo(); });
+let gErrRedirect = null;
+getRedirectResult(auth).catch((e) => { gErrRedirect = (e && e.code) || "error"; });
+const gInfo = (u) => (u ? { uid: u.uid, email: u.email || "", nombre: u.displayName || "" } : null);
 const TP = "terrapesos-data-v1", MOV = "terrapesos-movimientos";
 const J = (s) => { if (!s.exists()) return null; try { return JSON.parse(s.data().value); } catch (e) { return null; } };
 const addT = (p, n) => ((parseInt(String(p).replace(/[.\s]/g, ""), 10) || 0) + n).toLocaleString("es-CL");
@@ -78,6 +88,27 @@ const api = {
       if (s.exists()) { try { d = JSON.parse(s.data().value) || {}; } catch (e) {} }
       tx.set(ref, { value: JSON.stringify(fn(d)) });
     });
+  },
+  /* cuenta Google */
+  google: {
+    dominio: DOMINIO_INSTITUCIONAL,
+    async usuario() { await Promise.race([gPrimera, new Promise((r) => setTimeout(r, 6000))]); return gInfo(gUser); },
+    errorRedirect() { const e = gErrRedirect; gErrRedirect = null; return e; },
+    async entrar() {
+      const p = new GoogleAuthProvider();
+      p.setCustomParameters({ prompt: "select_account", ...(DOMINIO_INSTITUCIONAL ? { hd: DOMINIO_INSTITUCIONAL } : {}) });
+      try { const r = await signInWithPopup(auth, p); return { ok: true, user: gInfo(r.user) }; }
+      catch (e) {
+        const c = e && e.code;
+        if (c === "auth/popup-blocked" || c === "auth/operation-not-supported-in-this-environment") {
+          try { await signInWithRedirect(auth, p); return { redirect: true }; } catch (e2) { return { error: (e2 && e2.code) || "error" }; }
+        }
+        return { error: c || "error" };
+      }
+    },
+    async salir() { try { await signOut(auth); } catch (e) {} },
+    // solo el documento propio: shared/perfil-<uid> = {"uid","email","curso","nombre","fecha"}
+    async perfil(uid) { return J(await getDoc(doc(db, "shared", "perfil-" + uid))); },
   },
   /* genéricos (duelos): documentos {value: JSON} de la colección shared */
   TP, MOV,
@@ -4087,16 +4118,79 @@ async function resetStudent() {
     SFX.heal(); await say(nombre + " quedó en cero.", { auto: 50 });
   } catch (e) { await say("No se pudo reiniciar. Intenta de nuevo.", { auto: 50 }); }
 }
+const DEUS_URL = "https://fernandodelgadillo13.github.io/Deusivenatura/", JUEGO_URL = "https://filocaptura.github.io/";
+const aviso = (t, x, u, b) => (window.filoAviso ? window.filoAviso(t, x, u, b) : say(x));
+const gErrTxt = (c) => c === "auth/popup-closed-by-user" || c === "auth/cancelled-popup-request" ? "Cerraste la ventana de Google antes de terminar."
+  : c === "auth/unauthorized-domain" ? "Este sitio aún no está autorizado en Firebase. Avísale al profesor."
+  : c === "auth/network-request-failed" ? "Sin conexión con Google. Revisa internet."
+  : c === "auth/disallowed-useragent" || c === "auth/operation-not-supported-in-this-environment" ? "Este navegador no permite entrar con Google. Abre el juego en Chrome o Safari."
+  : "No se pudo entrar con Google (" + (c || "error") + ").";
+/* con una cuenta Google ya abierta: busca su perfil (shared/perfil-<uid>) creado en Deusivenatura */
+async function idDesdeGoogle(gu) {
+  const dom = DB.google.dominio;
+  if (dom && !String(gu.email).toLowerCase().endsWith("@" + dom.toLowerCase())) {
+    await say("Usa tu cuenta institucional (@" + dom + "). La cuenta " + gu.email + " no está permitida.");
+    await DB.google.salir(); return false;
+  }
+  for (;;) {
+    ui.prompt = ["Buscando tu", "perfil…"]; ui.promptW = 100;
+    let p = null, err = false;
+    try { p = await withTimeout(DB.google.perfil(gu.uid), 8000); } catch (e) { err = true; }
+    ui.prompt = null; ui.promptW = 236;
+    if (p && p.curso && p.nombre) {
+      ID = { curso: p.curso, nombre: p.nombre, key: slug(p.curso + "_" + p.nombre), admin: false, google: { uid: gu.uid, email: gu.email } };
+      try { localStorage.setItem("filosofos-id", JSON.stringify({ curso: p.curso, nombre: p.nombre, google: true })); } catch (e) {}
+      return true;
+    }
+    if (err) await say("No pude leer tu perfil. Revisa la conexión e intenta de nuevo.");
+    else await aviso("Vincula tu cuenta", "Tu cuenta <b>" + gu.email + "</b> todavía no está vinculada con tu nombre.<br><br>Primero vincula tu cuenta en <b>Deusivenatura</b> (menú → <b>Ingresar</b> → <b>Mi perfil</b>) y luego vuelve aquí.", DEUS_URL, "IR A DEUSIVENATURA");
+    ui.prompt = [gu.email.length > 22 ? gu.email.slice(0, 21) + "…" : gu.email]; ui.promptW = 150;
+    const r = await menu(["YA LO VINCULÉ", "CERRAR SESIÓN", "VOLVER"], { x: 108, y: 70, w: 128, cancel: true });
+    ui.prompt = null; ui.promptW = 236;
+    if (r === 0) continue;
+    if (r === 1) await DB.google.salir();
+    return false;
+  }
+}
+async function entrarConGoogle() {
+  if (window.filoEnApp) {
+    await aviso("Entrar con Google", "Google no permite iniciar sesión dentro de la app de Android.<br><br>Para jugar con tu cuenta, abre Filocaptura en <b>Chrome</b> (tu partida y tus terrapesos son los mismos). También puedes seguir aquí con «Entrar sin cuenta».", JUEGO_URL, "ABRIR EN CHROME");
+    return false;
+  }
+  ui.prompt = ["Abriendo", "Google…"]; ui.promptW = 100;
+  const r = await DB.google.entrar();
+  ui.prompt = null; ui.promptW = 236;
+  if (r.redirect) { ui.prompt = ["Redirigiendo", "a Google…"]; ui.promptW = 110; await frames(600); ui.prompt = null; ui.promptW = 236; return false; }
+  if (r.error) { await say(gErrTxt(r.error)); return false; }
+  return idDesdeGoogle(r.user);
+}
 async function identify() {
   let rem = null; try { rem = JSON.parse(localStorage.getItem("filosofos-id") || "null"); } catch (e) {}
   const setId = (curso, nombre) => { ID = { curso, nombre, key: slug(curso + "_" + nombre), admin: curso === "admin" }; try { localStorage.setItem("filosofos-id", JSON.stringify({ curso, nombre })); } catch (e) {} };
-  if (rem && rem.nombre && (rem.curso !== "admin")) { if (await confirmName(rem.nombre)) { setId(rem.curso, rem.nombre); return true; } }
+  const conGoogle = !!(DB && DB.google);
+  // 1) ¿ya hay una sesión de Google abierta en este navegador (o volvimos de un redirect)?
+  if (conGoogle) {
+    const ce = DB.google.errorRedirect(); if (ce) await say(gErrTxt(ce));
+    let gu = null; ui.prompt = ["Revisando", "tu sesión…"]; ui.promptW = 100;
+    try { gu = await DB.google.usuario(); } catch (e) {}
+    ui.prompt = null; ui.promptW = 236;
+    if (gu && await idDesdeGoogle(gu)) return true;
+  }
+  // 2) modo sin cuenta: recordar el último nombre elegido (como antes)
+  if (rem && rem.nombre && rem.curso !== "admin" && !rem.google) { if (await confirmName(rem.nombre)) { setId(rem.curso, rem.nombre); return true; } }
   const roster = await getRoster();
   for (;;) {
+    if (conGoogle) {
+      ui.prompt = ["¿Cómo quieres", "entrar?"]; ui.promptW = 110;
+      const m = await menu(["CONTINUAR CON GOOGLE", "ENTRAR SIN CUENTA"], { x: 60, y: 84, w: 150, cancel: true });
+      ui.prompt = null; ui.promptW = 236;
+      if (m === -1) return false;
+      if (m === 0) { if (await entrarConGoogle()) return true; continue; }
+    }
     ui.prompt = ["¿De qué curso", "eres?"]; ui.promptW = 110;
     const cm = await menu([...roster.map((c) => c.nombre), "PROFESOR / ADMIN"], { x: 50, y: 44, w: 140, cancel: true });
     ui.prompt = null; ui.promptW = 236;
-    if (cm === -1) return false;
+    if (cm === -1) { if (conGoogle) continue; return false; }
     if (cm === roster.length) {
       const pin = await pinEntry();
       if (pin === ADMIN_PIN) { setId("admin", ADMIN_NAME); return true; }
@@ -5075,7 +5169,7 @@ function drawTitle() {
   ctx.save(); ctx.translate(120, 36); ctx.scale(2, 2); txt("FILOCAPTURA", 0, 0, "#ffd86b", { align: "center", shadow: "#8a2a1a" }); ctx.restore();
   txt("La Aventura del Pensamiento", 120, 58, "#fff6d8", { align: "center", shadow: "#1b1d2e" });
   ["tales", "pitagoras", "protagoras"].forEach((id, i) => { const y = 74 + Math.round(Math.sin(tick / 14 + i * 2) * 3); dI(portrait(id, false), 22 + i * 74, y, 64, 64); });
-  if (ID) txt("Jugador: " + ID.nombre.split(" ")[0] + " " + ID.nombre.split(" ").slice(-2, -1).join(""), 120, 148, "#ffd86b", { align: "center", max: 220 }); else txt("Presiona A para comenzar", 120, 148, "#cfd6ee", { align: "center" });
+  if (ID) { txt("Jugador: " + ID.nombre.split(" ")[0] + " " + ID.nombre.split(" ").slice(-2, -1).join(""), 120, ID.google ? 140 : 148, "#ffd86b", { align: "center", max: 220 }); if (ID.google) txt("G · " + ID.google.email, 120, 150, "#cfd6ee", { align: "center", max: 220 }); } else txt("Presiona A para comenzar", 120, 148, "#cfd6ee", { align: "center" });
 }
 
 function drawAll() {
@@ -5140,7 +5234,7 @@ async function titleScreen() {
     if (!(await identify())) { ID = null; continue; }
     await loadProfile();
     for (;;) {
-      const opts = []; if (hasSave()) opts.push("CONTINUAR"); opts.push("NUEVO JUEGO", "MIS LOGROS"); if (!ID.admin && comodinGanado()) opts.push("MI COMODÍN"); if (ID.admin) opts.push("COMODINES", "DUELOS", "CLAVES DE PUERTAS", "REINICIAR ALUMNO", "PROBAR CONEXIÓN"); opts.push("CAMBIAR JUGADOR");
+      const opts = []; if (hasSave()) opts.push("CONTINUAR"); opts.push("NUEVO JUEGO", "MIS LOGROS"); if (!ID.admin && comodinGanado()) opts.push("MI COMODÍN"); if (ID.admin) opts.push("COMODINES", "DUELOS", "CLAVES DE PUERTAS", "REINICIAR ALUMNO", "PROBAR CONEXIÓN"); opts.push(ID.google ? "CERRAR SESIÓN" : "CAMBIAR JUGADOR");
       const r = await menu(opts, { x: 52, y: opts.length > 4 ? Math.max(4, 150 - (opts.length * 12 + 10)) : 84, w: 136, cancel: false });
       const choice = opts[r];
       if (choice === "CONTINUAR") { if (loadGame()) { await fadeTo(1, 12); await startGame(false); return; } }
@@ -5155,6 +5249,7 @@ async function titleScreen() {
       else if (choice === "DUELOS") await adminDuelos();
       else if (choice === "PROBAR CONEXIÓN") await adminDiagnostico();
       else if (choice === "CLAVES DE PUERTAS") await adminKeys();
+      else if (choice === "CERRAR SESIÓN") { await cloudSave(); if (DB && DB.google) await DB.google.salir(); try { localStorage.removeItem("filosofos-id"); } catch (e) {} SFX.select(); await say("Sesión cerrada. ¡Hasta pronto!", { auto: 40 }); ID = null; break; }
       else { try { localStorage.removeItem("filosofos-id"); } catch (e) {} ID = null; break; }
     }
   }
@@ -5221,6 +5316,20 @@ Promise.all([fontReady, loadTextures(), withTimeout(window.FILO_READY || Promise
     document.getElementById("instok").onclick = function(){ box.style.display = "none"; };
   }
   if (b) b.addEventListener("click", function(){ steps(); });
-  if (box) box.addEventListener("click", function(e){ if (e.target === box) box.style.display = "none"; });
+  /* aviso con enlace (lo usa el juego, p. ej. para vincular la cuenta en Deusivenatura) */
+  window.filoAviso = function (titulo, texto, url, boton) {
+    var h = "<h3>" + titulo + "</h3>" + texto;
+    if (url) h += '<br><br><a id="avisolink" href="' + url + '" target="_blank" rel="noopener" style="display:inline-block;color:#fff;background:#6a5ae0;border:2px solid #cfc8ff;border-radius:10px;padding:8px 12px;text-decoration:none">' + (boton || "ABRIR") + "</a>";
+    h += '<br><button id="instok">CERRAR</button>';
+    inn.innerHTML = h; box.style.display = "flex";
+    return new Promise(function (res) {
+      var fin = function () { window._avisoFin = null; box.style.display = "none"; res(); };
+      window._avisoFin = fin;
+      document.getElementById("instok").onclick = fin;
+      var l = document.getElementById("avisolink"); if (l) l.addEventListener("click", function () { setTimeout(fin, 300); });
+    });
+  };
+  window.filoEnApp = location.hostname === "appassets.androidplatform.net";
+  if (box) box.addEventListener("click", function(e){ if (e.target === box) { box.style.display = "none"; if (window._avisoFin) { var f = window._avisoFin; window._avisoFin = null; f(); } } });
 })();
 </script></body></html>
